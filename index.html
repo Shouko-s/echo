@@ -1,0 +1,2299 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Эхо</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #04040a; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; }
+  canvas { display: block; image-rendering: pixelated; image-rendering: crisp-edges; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+"use strict";
+
+// =====================================================================
+//  1. КОНСТАНТЫ
+// =====================================================================
+const TILE = 16;
+const COLS = 30;
+const ROWS = 16;
+const HUD_H = 32;                       // полоса HUD над уровнем
+const VIEW_W = COLS * TILE;             // 480 логических пикселей
+const WORLD_H = ROWS * TILE;            // 256
+const VIEW_H = WORLD_H + HUD_H;         // 288
+
+const TPS = 60;                         // фиксированный шаг симуляции
+const STEP = 1 / TPS;
+const REWIND_TICKS = 5 * TPS;           // глубина перемотки — 5 секунд
+const MIN_ECHO_TICKS = 15;              // слишком короткая запись эхо не создаёт
+
+// Игрок
+const P_W = 10, P_H = 14;
+const GRAVITY = 0.36;
+const MAX_FALL = 7;
+const RUN_SPEED = 2.0;
+const GROUND_ACCEL = 0.45;
+const GROUND_DECEL = 0.6;
+const AIR_ACCEL = 0.32;
+const AIR_DECEL = 0.12;
+const JUMP_VELOCITY = 5.7;              // ≈ 2.6 тайла в высоту: 2 тайла — можно, 3 — только с эхо
+const JUMP_CUT = 0.45;                  // отпустил прыжок — скорость вверх умножается на это
+const COYOTE_TICKS = 6;                 // ~100 мс
+const JUMP_BUFFER_TICKS = 6;            // ~100 мс
+const SPRING_VELOCITY = 8.2;            // пружина: ≈ 5.5 тайла в высоту
+const EPS = 0.001;
+
+// Эффекты и таймеры (в тиках)
+const DOOR_ANIM_SPEED = 0.2;
+const REWIND_FX_TICKS = 18;             // ~0.3 с
+const DEATH_TICKS = 45;
+const WIN_TICKS = 70;
+const INTRO_TICKS = 150;
+
+const COL = {
+  bg0: '#07071a', bg1: '#0d0b24',
+  grid: 'rgba(110,120,255,0.05)',
+  wall: '#11122b', wallEdge: '#5b6cff',
+  spike: '#ff3355',
+  player: '#ff9a1f',
+  echo: '#4de8ff',
+  visor: '#0a0a18',
+  exit: '#f4f1ff',
+  hud: '#06060f', text: '#ffffff', hint: '#a9b4ff', dim: '#4a4f7a',
+  laser: '#ff2b6a', spring: '#7dffcf', loop: '#9fb4ff',
+};
+const KEY_COLORS = { a: '#ffe14d', b: '#ff4fd8', c: '#4dff88', d: '#b388ff' };
+const SAVE_KEY = 'echo-progress-v1';
+const FONT = 'ui-monospace, Menlo, Consolas, "Courier New", monospace';
+
+// =====================================================================
+//  2. ВВОД
+// =====================================================================
+// Одна клавиша может давать несколько действий (↑ — прыжок в игре и «вверх» в меню)
+const KEYMAP = {
+  ArrowLeft: ['left'], KeyA: ['left'],
+  ArrowRight: ['right'], KeyD: ['right'],
+  ArrowUp: ['jump', 'up'], KeyW: ['jump', 'up'], Space: ['jump', 'confirm'],
+  ArrowDown: ['down'], KeyS: ['down'],
+  ShiftLeft: ['rewind'], ShiftRight: ['rewind'],
+  KeyR: ['restart'],
+  Enter: ['confirm'], NumpadEnter: ['confirm'],
+  Escape: ['back'],
+  KeyM: ['mute'],
+};
+
+// held — клавиша зажата; pressed — нажата с прошлого тика (сбрасывается в конце тика)
+const Input = {
+  held: {},
+  pressed: {},
+  down(a) { return !!this.held[a]; },
+  hit(a) { return !!this.pressed[a]; },
+  endTick() { this.pressed = {}; },
+};
+
+window.addEventListener('keydown', (e) => {
+  Sound.init();                         // аудио можно запустить только после жеста пользователя
+  const acts = KEYMAP[e.code];
+  if (!acts) return;
+  e.preventDefault();
+  for (const a of acts) {
+    if (!e.repeat) Input.pressed[a] = true;
+    Input.held[a] = true;
+  }
+});
+window.addEventListener('keyup', (e) => {
+  const acts = KEYMAP[e.code];
+  if (!acts) return;
+  e.preventDefault();
+  for (const a of acts) Input.held[a] = false;
+});
+window.addEventListener('blur', () => { Input.held = {}; });
+
+// =====================================================================
+//  3. ЗВУК (Web Audio API, все звуки генерируются)
+// =====================================================================
+const Sound = {
+  ctx: null, master: null, noiseBuf: null, muted: false,
+
+  init() {
+    if (this.ctx) {
+      if (this.ctx.state === 'suspended') this.ctx.resume();
+      return;
+    }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    try {
+      this.ctx = new AC();
+      this.master = this.ctx.createGain();
+      this.master.gain.value = 0.45;
+      this.master.connect(this.ctx.destination);
+      const len = Math.floor(this.ctx.sampleRate * 0.6);
+      this.noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+      const data = this.noiseBuf.getChannelData(0);
+      for (let i = 0; i < len; i++) data[i] = Math.random() * 2 - 1;
+    } catch (e) {
+      this.ctx = null;
+    }
+  },
+
+  toggleMute() {
+    this.muted = !this.muted;
+    if (this.master) this.master.gain.value = this.muted ? 0 : 0.45;
+  },
+
+  tone(f0, f1, dur, type = 'square', vol = 0.08, delay = 0) {
+    const c = this.ctx;
+    const t = c.currentTime + delay;
+    const o = c.createOscillator();
+    const g = c.createGain();
+    o.type = type;
+    o.frequency.setValueAtTime(f0, t);
+    if (f1 !== f0) o.frequency.exponentialRampToValueAtTime(f1, t + dur);
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(vol, t + 0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    o.connect(g); g.connect(this.master);
+    o.start(t); o.stop(t + dur + 0.03);
+  },
+
+  noise(dur, vol = 0.1, freq = 1200, delay = 0) {
+    const c = this.ctx;
+    const t = c.currentTime + delay;
+    const src = c.createBufferSource();
+    src.buffer = this.noiseBuf;
+    const f = c.createBiquadFilter();
+    f.type = 'lowpass';
+    f.frequency.setValueAtTime(freq, t);
+    f.frequency.exponentialRampToValueAtTime(Math.max(60, freq * 0.15), t + dur);
+    const g = c.createGain();
+    g.gain.setValueAtTime(vol, t);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(f); f.connect(g); g.connect(this.master);
+    src.start(t); src.stop(t + dur + 0.03);
+  },
+};
+
+const SFX = {
+  jump()      { Sound.tone(260, 560, 0.12, 'square', 0.05); },
+  land()      { Sound.tone(150, 60, 0.08, 'triangle', 0.09); },
+  buttonOn()  { Sound.tone(520, 880, 0.07, 'square', 0.05); },
+  buttonOff() { Sound.tone(480, 260, 0.08, 'square', 0.035); },
+  door()      { Sound.tone(180, 110, 0.18, 'sawtooth', 0.03); },
+  rewind()    {
+    Sound.tone(1400, 140, 0.38, 'sawtooth', 0.05);
+    Sound.tone(700, 70, 0.38, 'square', 0.03);
+    Sound.noise(0.3, 0.07, 3000);
+  },
+  deny()      { Sound.tone(120, 90, 0.16, 'square', 0.06); },
+  death()     { Sound.tone(420, 40, 0.5, 'sawtooth', 0.08); Sound.noise(0.45, 0.14, 900); },
+  win()       { [523, 659, 784, 1047, 1319].forEach((f, i) => Sound.tone(f, f, 0.2, 'square', 0.05, i * 0.08)); },
+  select()    { Sound.tone(660, 660, 0.05, 'square', 0.04); },
+  start()     { Sound.tone(392, 784, 0.18, 'triangle', 0.08); },
+  spring()    { Sound.tone(180, 900, 0.22, 'triangle', 0.09); Sound.tone(360, 1400, 0.12, 'square', 0.025); },
+  zap()       { Sound.tone(1800, 200, 0.25, 'sawtooth', 0.05); },
+};
+
+function sfx(name) {
+  if (!Sound.ctx || Sound.muted) return;
+  try { SFX[name](); } catch (e) { /* звук не критичен */ }
+}
+
+// =====================================================================
+//  4. УРОВНИ
+//  # стена   P старт   E выход   ^ шипы   S пружина
+//  a–d кнопки, A–D двери: открыты, ПОКА кнопка нажата
+//  W X Y Z  двери-инверторы для a b c d: закрыты, пока кнопка нажата
+//  > < v    лазерные излучатели (бьют вправо / влево / вниз); луч гасят стены,
+//           закрытые двери, платформы и эхо — эхо работает как щит
+//  1–9 движущаяся платформа (параметры — в поле platforms; dx/dy в тайлах):
+//      с key — едет, пока кнопка нажата; без key — маятник по таймеру (wait, phase в тиках)
+// =====================================================================
+const LEVELS = [
+  {
+    name: 'Первые шаги',
+    diff: 1,
+    hint: '←/→ — бег, ↑/Пробел — прыжок (держи дольше — выше). Дойди до выхода.',
+    echoes: 1,
+    map: [
+      '##############################',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#.........................E..#',
+      '#......................#######',
+      '#...................##########',
+      '#...........##...##.##########',
+      '#.P....#....##^^^##.##########',
+      '##############################',
+    ],
+  },
+  {
+    name: 'Кнопка и дверь',
+    diff: 1,
+    hint: 'Встань на кнопку и нажми Shift: эхо повторит путь и удержит её.',
+    echoes: 1,
+    map: [
+      '##############################',
+      '#...................#........#',
+      '#...................#........#',
+      '#...................#........#',
+      '#...................#........#',
+      '#...................#........#',
+      '#...................#........#',
+      '#...................#........#',
+      '#...................#........#',
+      '#...................#........#',
+      '#...................#........#',
+      '#...................#........#',
+      '#...................A........#',
+      '#...................A........#',
+      '#.P.......a.........A.....E..#',
+      '##############################',
+    ],
+  },
+  {
+    name: 'Ступенька',
+    diff: 1,
+    hint: 'Слишком высоко? На эхо можно встать — запрыгни ему на голову.',
+    echoes: 1,
+    map: [
+      '##############################',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#.........................E..#',
+      '#.....................########',
+      '#.....................########',
+      '#..P..................########',
+      '##############################',
+    ],
+  },
+  {
+    name: 'Две двери',
+    diff: 2,
+    hint: 'Две кнопки — две двери. Каждой кнопке нужно своё эхо.',
+    echoes: 2,
+    map: [
+      '##############################',
+      '#..........#.........#.......#',
+      '#..........#.........#.......#',
+      '#..........#.........#.......#',
+      '#..........#.........#.......#',
+      '#..........#.........#.......#',
+      '#..........#.........#.......#',
+      '#..........#.........#.......#',
+      '#..........#.........#.......#',
+      '#..........#.........#.......#',
+      '#..........#.........#.......#',
+      '#..........#....b....#.......#',
+      '#..........A...###...B.......#',
+      '#..........A..#####..B.......#',
+      '#.P....a...A.#######.B....E..#',
+      '##############################',
+    ],
+  },
+  {
+    name: 'Точный расчёт',
+    diff: 2,
+    hint: 'Эхо нажмёт кнопку в тот же миг, что и ты. Успей на платформу! R — заново',
+    echoes: 1,
+    platforms: { 1: { key: 'c', dx: 10, dy: 0, speed: 1.2 } },
+    map: [
+      '##############################',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#.c........P...............E.#',
+      '##############11^^^^^^^^^^####',
+      '##############################',
+    ],
+  },
+  {
+    name: 'Эхо прошлого',
+    diff: 2,
+    hint: 'Лифт, дверь и ступенька. Три эха — ни одного лишнего.',
+    echoes: 3,
+    platforms: { 1: { key: 'b', dx: 0, dy: -7, speed: 1.2 } },
+    map: [
+      '##############################',
+      '#.................#..........#',
+      '#.................#..........#',
+      '#.................#.......E..#',
+      '#.................A....#######',
+      '#.................A....#######',
+      '#............a....A....#######',
+      '########..####################',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#.P.....11................b..#',
+      '##############################',
+    ],
+  },
+  // --- NEW LEVELS START
+  {
+    name: 'Застывший прыжок',
+    diff: 3,
+    hint: 'Яма слишком широкая. Эхо замирает там, где ты нажал Shift — даже в воздухе.',
+    echoes: 1,
+    map: [
+      '##############################',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#..P......................E..#',
+      '#########.......##############',
+      '#########.......##############',
+      '#########^^^^^^^##############',
+      '##############################',
+    ],
+  },
+  {
+    name: 'Щит',
+    diff: 3,
+    hint: 'Луч гасят стены, закрытые двери… и эхо. Поставь щит, пока луч выключен.',
+    echoes: 2,
+    map: [
+      '##############################',
+      '#............v#..............#',
+      '#............A#..............#',
+      '#.............#..............#',
+      '#.............#..............#',
+      '#.............#..............#',
+      '#.............#..............#',
+      '#.............#..............#',
+      '#.............#..............#',
+      '#.............#..............#',
+      '#.............#..............#',
+      '#.............#..............#',
+      '#.............A..............#',
+      '#.............A..............#',
+      '#.P..a........A............E.#',
+      '##############################',
+    ],
+  },
+  {
+    name: 'Эхо-ракета',
+    diff: 3,
+    hint: 'Пружина не добросит. Но эхо, застывшее в полёте, — тоже опора.',
+    echoes: 1,
+    map: [
+      '##############################',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#.........................E..#',
+      '#..............###############',
+      '#..............###############',
+      '#..............###############',
+      '#..............###############',
+      '#..............###############',
+      '#..P......^^^.S###############',
+      '##############################',
+    ],
+  },
+  {
+    name: 'Инверсия',
+    diff: 3,
+    hint: 'Штрихованные двери — инверторы: закрыты, ПОКА кнопка нажата.',
+    echoes: 1,
+    map: [
+      '##############################',
+      '#...........#....#...........#',
+      '#...........#....#...........#',
+      '#...........#....#...........#',
+      '#...........#....#...........#',
+      '#...........#....#...........#',
+      '#...........#....#...........#',
+      '#...........#....#...........#',
+      '#...........#....#...........#',
+      '#...........#....#...........#',
+      '#...........#....#...........#',
+      '#...........#....#...........#',
+      '#...........B....X...........#',
+      '#...........B....X...........#',
+      '#.P..b......B^...X........E..#',
+      '##############################',
+    ],
+  },
+  {
+    name: 'Катапульта',
+    diff: 4,
+    hint: 'Встань эхо на голову. Когда оно прыгнет — прыгай и ты.',
+    echoes: 1,
+    map: [
+      '##############################',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#.........................E..#',
+      '#.................############',
+      '#.................############',
+      '#.................############',
+      '#.................############',
+      '#..P..............############',
+      '##############################',
+    ],
+  },
+  {
+    name: 'Маятники',
+    diff: 4,
+    hint: 'Над головой луч — прыгай низко. Платформы ходят сами и перематываются вместе со временем.',
+    echoes: 1,
+    platforms: { 1: { dx: 4, dy: 0, speed: 1, wait: 40 }, 2: { dx: 4, dy: 0, speed: 1, wait: 40, phase: 104 }, 3: { dx: 4, dy: 0, speed: 1, wait: 40 } },
+    map: [
+      '##############################',
+      '#.#..........................#',
+      '#.#..........................#',
+      '#.#..........................#',
+      '#.#..........................#',
+      '#.#..........................#',
+      '#.#..........................#',
+      '#.#..........................#',
+      '#.#..........................#',
+      '#.#..........................#',
+      '#.#..........................<',
+      '#.A..........................#',
+      '#EAP.......................a.#',
+      '####11......22......33....####',
+      '####^^^^^^^^^^^^^^^^^^^^^^####',
+      '##############################',
+    ],
+  },
+  {
+    name: 'Двойная роль',
+    diff: 4,
+    hint: 'Эхо одно, а нужно двое. Но за 5 секунд эхо успевает многое.',
+    echoes: 1,
+    map: [
+      '##############################',
+      '#.....#......................#',
+      '#.....#......................#',
+      '#.....#......................#',
+      '#.....#......................#',
+      '#.....#......................#',
+      '#.....#......................#',
+      '#.....#......................#',
+      '#.....#......................#',
+      '#.....A......................#',
+      '#.....A......................#',
+      '#.E...A......................#',
+      '###########..................#',
+      '###########..................#',
+      '###########.........P......a.#',
+      '##############################',
+    ],
+  },
+  {
+    name: 'Лифт для двоих',
+    diff: 4,
+    hint: 'Лифт едет, пока нажата b. Дверь наверху — пока нажата a. Эхо одно.',
+    echoes: 1,
+    platforms: { 1: { key: 'b', dx: 0, dy: -7, speed: 1.2 } },
+    map: [
+      '##############################',
+      '#..............#.............#',
+      '#..............#.............#',
+      '#..............#.............#',
+      '#..............A.............#',
+      '#..............A.............#',
+      '#..............A........E....#',
+      '###..#########################',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#..11.P.....b...^^......a....#',
+      '##############################',
+    ],
+  },
+  // --- NEW LEVELS END
+];
+
+// Превращает ASCII-карту в структуры уровня
+function parseLevel(def) {
+  const L = {
+    def, solid: [], doorAt: [], spikes: [], buttons: [], doors: [], platforms: [],
+    lasers: [], beams: [], springs: [],
+    start: { x: 1, y: 1 }, exit: { x: 1, y: 1 },
+  };
+  const INVERTED = { W: 'a', X: 'b', Y: 'c', Z: 'd' };
+  const LASER_DIR = { '>': [1, 0], '<': [-1, 0], v: [0, 1] };
+  if (def.map.length !== ROWS) console.warn(`Уровень «${def.name}»: ожидается ${ROWS} строк`);
+  const doorByKey = {};
+  const platCells = {};
+  for (let y = 0; y < ROWS; y++) {
+    const row = def.map[y] || '';
+    if (row.length !== COLS) console.warn(`Уровень «${def.name}», строка ${y}: длина ${row.length}, нужно ${COLS}`);
+    L.solid[y] = [];
+    L.doorAt[y] = [];
+    for (let x = 0; x < COLS; x++) {
+      const ch = row[x] || '#';
+      L.solid[y][x] = ch === '#' || !!LASER_DIR[ch];
+      L.doorAt[y][x] = null;
+      if (ch === 'P') L.start = { x, y };
+      else if (ch === 'E') L.exit = { x, y };
+      else if (ch === '^') L.spikes.push({ x, y });
+      else if (ch === 'S') L.springs.push({ x, y, squash: 0 });
+      else if (LASER_DIR[ch]) L.lasers.push({ x, y, dir: LASER_DIR[ch] });
+      else if (ch >= 'a' && ch <= 'd') L.buttons.push({ key: ch, x, y, pressed: false });
+      else if ((ch >= 'A' && ch <= 'D') || INVERTED[ch]) {
+        const inv = !!INVERTED[ch];
+        const key = inv ? INVERTED[ch] : ch.toLowerCase();
+        if (!doorByKey[ch]) {
+          doorByKey[ch] = { key, inv, cells: [], open: inv, amt: inv ? 1 : 0 };
+          L.doors.push(doorByKey[ch]);
+        }
+        doorByKey[ch].cells.push({ x, y });
+        L.doorAt[y][x] = doorByKey[ch];
+      } else if (ch >= '1' && ch <= '9') {
+        (platCells[ch] = platCells[ch] || []).push({ x, y });
+      }
+    }
+  }
+  for (const id of Object.keys(platCells)) {
+    const cells = platCells[id];
+    const cfg = (def.platforms && def.platforms[id]) || { key: 'a', dx: 0, dy: 0, speed: 1 };
+    const x0 = Math.min(...cells.map(c => c.x));
+    const ox = x0 * TILE, oy = cells[0].y * TILE;
+    const ex = cfg.dx * TILE, ey = cfg.dy * TILE;
+    L.platforms.push({
+      key: cfg.key || null, ox, oy, ex, ey, w: cells.length * TILE, h: 5,
+      len: Math.hypot(ex, ey) || 1, speed: cfg.speed || 1,
+      wait: cfg.wait != null ? cfg.wait : 30, phase: cfg.phase || 0,
+      p: 0, x: ox, y: oy, prevX: ox, prevY: oy, dx: 0, dy: 0,
+    });
+  }
+  return L;
+}
+
+// =====================================================================
+//  5. СОСТОЯНИЕ ИГРЫ И СОХРАНЕНИЕ
+// =====================================================================
+const game = {
+  state: 'title',          // title | select | play | dying | win | between | end
+  levelIndex: 0,
+  level: null,
+  t: 0,                    // время уровня в тиках (перематывается)
+  clock: 0,                // реальные тики (не перематывается, для анимаций)
+  player: null,
+  echoes: [],
+  echoesLeft: 0,
+  rec: [],                 // кольцевой буфер кадров игрока (≤ 5 с)
+  snaps: [],               // параллельный буфер снимков мира
+  particles: [],
+  rings: [],               // ударные волны (декор)
+  trail: null,             // путь, «сматывающийся» при перемотке (декор)
+  fade: 0,                 // затемнение при входе в уровень
+  timer: 0,
+  introT: 0,
+  menuSel: 0,
+  deaths: 0,
+  playTicks: 0,            // время попытки (реальное, перемотка его не откатывает)
+  fx: { rewind: 0, shake: 0, flash: 0 },
+};
+
+// Прогресс: какие уровни пройдены и лучшие результаты. Открыт уровень, если пройдено
+// не меньше (номер − 1) уровней — то есть один трудный уровень можно пропустить.
+const Save = {
+  cleared: [],
+  best: {},                // { [index]: { ticks, echoes } }
+  load() {
+    try {
+      const raw = window.localStorage.getItem(SAVE_KEY);
+      const data = raw ? JSON.parse(raw) : null;
+      if (!data) return;
+      if (Array.isArray(data.cleared)) this.cleared = data.cleared.map(Boolean);
+      else if (Number.isFinite(data.done)) for (let i = 0; i < data.done; i++) this.cleared[i] = true;  // старый формат
+      if (data.best && typeof data.best === 'object') this.best = data.best;
+    } catch (e) { /* localStorage недоступен — играем без сохранений */ }
+  },
+  write() {
+    try { window.localStorage.setItem(SAVE_KEY, JSON.stringify({ cleared: this.cleared, best: this.best })); } catch (e) { /* ignore */ }
+  },
+  complete(index, ticks, echoes) {
+    this.cleared[index] = true;
+    const b = this.best[index];
+    this.best[index] = b ? { ticks: Math.min(b.ticks, ticks), echoes: Math.min(b.echoes, echoes) } : { ticks, echoes };
+    this.write();
+  },
+  count() { return LEVELS.reduce((n, _, i) => n + (this.cleared[i] ? 1 : 0), 0); },
+  isUnlocked(i) { return i <= this.count() + 1; },
+  firstOpen() {
+    for (let i = 0; i < LEVELS.length; i++) if (!this.cleared[i] && this.isUnlocked(i)) return i;
+    return 0;
+  },
+};
+
+function newPlayer(start) {
+  return {
+    x: start.x * TILE + (TILE - P_W) / 2,
+    y: (start.y + 1) * TILE - P_H,
+    vx: 0, vy: 0, face: 1,
+    grounded: true, ground: 'tile',
+    coyote: 0, jumpBuf: 0, jumpCut: true,
+    anim: 'idle', ph: 0, sx: 1, sy: 1,
+  };
+}
+
+function loadLevel(index, showIntro) {
+  game.levelIndex = index;
+  game.level = parseLevel(LEVELS[index]);
+  game.player = newPlayer(game.level.start);
+  game.echoes = [];
+  game.echoesLeft = LEVELS[index].echoes;
+  game.particles = [];
+  game.rings = [];
+  game.trail = null;
+  game.fade = 1;
+  game.t = 0;
+  game.rec = [];
+  game.snaps = [];
+  game.state = 'play';
+  game.introT = showIntro ? INTRO_TICKS : 0;
+  game.playTicks = 0;
+  if (showIntro) game.deaths = 0;
+  updatePlatforms();
+  computeBeams();
+  record();
+  game.t = 1;
+  buildLevelCache();
+  savePrev();
+}
+
+function toTitle() {
+  game.state = 'title';
+  game.particles = [];
+}
+
+function toSelect(index) {
+  game.state = 'select';
+  game.menuSel = index != null ? index : Save.firstOpen();
+  game.particles = [];
+}
+
+// =====================================================================
+//  6. ФИЗИКА И КОЛЛИЗИИ
+// =====================================================================
+function isSolid(cx, cy) {
+  if (cx < 0 || cx >= COLS || cy < 0 || cy >= ROWS) return true;
+  const L = game.level;
+  if (L.solid[cy][cx]) return true;
+  const d = L.doorAt[cy][cx];
+  return !!(d && !d.open);
+}
+
+function overlap(ax, ay, aw, ah, bx, by, bw, bh) {
+  return ax < bx + bw && ax + aw > bx && ay < by + bh && ay + ah > by;
+}
+
+// Перемещение по X с коллизией о тайлы (оси раздельно — нет застревания в углах)
+function moveX(e, dx) {
+  if (!dx) return false;
+  e.x += dx;
+  const r0 = Math.floor(e.y / TILE), r1 = Math.floor((e.y + P_H - EPS) / TILE);
+  if (dx > 0) {
+    const c = Math.floor((e.x + P_W - EPS) / TILE);
+    for (let r = r0; r <= r1; r++) if (isSolid(c, r)) { e.x = c * TILE - P_W; return true; }
+  } else {
+    const c = Math.floor(e.x / TILE);
+    for (let r = r0; r <= r1; r++) if (isSolid(c, r)) { e.x = (c + 1) * TILE; return true; }
+  }
+  return false;
+}
+
+// Твёрдые сверху поверхности: движущиеся платформы и эхо
+function oneWaySurfaces() {
+  const list = [];
+  for (const pl of game.level.platforms) {
+    list.push({ x: pl.x, w: pl.w, top: pl.y, prevTop: pl.prevY, ref: pl });
+  }
+  for (const e of game.echoes) {
+    list.push({ x: e.x, w: P_W, top: e.y, prevTop: e.prevY, ref: e });
+  }
+  return list;
+}
+
+// Перемещение по Y. Возвращает 'floor' | 'ceil' | null; при приземлении пишет e.ground
+function moveY(e, dy, withOneWay) {
+  if (!dy) return null;
+  const prevBottom = e.y + P_H;
+  e.y += dy;
+  const c0 = Math.floor(e.x / TILE), c1 = Math.floor((e.x + P_W - EPS) / TILE);
+  if (dy < 0) {
+    const r = Math.floor(e.y / TILE);
+    for (let c = c0; c <= c1; c++) if (isSolid(c, r)) { e.y = (r + 1) * TILE; return 'ceil'; }
+    return null;
+  }
+  let bestTop = Infinity, ground = null;
+  const r = Math.floor((e.y + P_H - EPS) / TILE);
+  for (let c = c0; c <= c1; c++) {
+    if (isSolid(c, r)) { bestTop = r * TILE; ground = 'tile'; break; }
+  }
+  if (withOneWay) {
+    for (const s of oneWaySurfaces()) {
+      if (e.x < s.x + s.w && e.x + P_W > s.x &&
+          prevBottom <= Math.max(s.top, s.prevTop) + 0.05 &&
+          e.y + P_H >= s.top && s.top <= bestTop) {
+        bestTop = s.top; ground = s.ref;          // при равной высоте предпочитаем движущуюся опору
+      }
+    }
+  }
+  if (ground) { e.y = bestTop - P_H; e.ground = ground; return 'floor'; }
+  return null;
+}
+
+// Если игрок стоит на платформе или эхо — переносим его вместе с опорой
+function carryPlayer() {
+  const p = game.player;
+  const g = p.ground;
+  if (!g || g === 'tile') return;
+  if (g.dx) moveX(p, g.dx);
+  if (g.dy) moveY(p, g.dy, false);
+}
+
+function updatePlayer() {
+  const p = game.player;
+  const dir = (Input.down('right') ? 1 : 0) - (Input.down('left') ? 1 : 0);
+
+  // Горизонталь: ускорение / торможение
+  const accel = p.grounded ? GROUND_ACCEL : AIR_ACCEL;
+  const decel = p.grounded ? GROUND_DECEL : AIR_DECEL;
+  if (dir !== 0) {
+    const turning = Math.sign(p.vx) === -dir;
+    p.vx += dir * (turning ? accel + decel : accel);
+    p.vx = Math.max(-RUN_SPEED, Math.min(RUN_SPEED, p.vx));
+    p.face = dir;
+  } else if (Math.abs(p.vx) <= decel) {
+    p.vx = 0;
+  } else {
+    p.vx -= Math.sign(p.vx) * decel;
+  }
+
+  // Прыжок: coyote time + буфер нажатия
+  if (Input.hit('jump')) p.jumpBuf = JUMP_BUFFER_TICKS;
+  else if (p.jumpBuf > 0) p.jumpBuf--;
+  if (p.grounded) p.coyote = COYOTE_TICKS;
+  else if (p.coyote > 0) p.coyote--;
+
+  if (p.jumpBuf > 0 && p.coyote > 0) {
+    p.vy = -JUMP_VELOCITY;
+    p.jumpBuf = 0;
+    p.coyote = 0;
+    p.jumpCut = false;
+    p.grounded = false;
+    p.ground = null;
+    p.sx = 0.7; p.sy = 1.3;
+    spawnParticles(p.x + P_W / 2, p.y + P_H, 6, '#c9c9ff', { angle: Math.PI / 2, spread: 2.4, speed: 1, life: 18, grav: 0.02 });
+    sfx('jump');
+  }
+  // Переменная высота прыжка
+  if (!p.jumpCut && p.vy < 0 && !Input.down('jump')) {
+    p.vy *= JUMP_CUT;
+    p.jumpCut = true;
+  }
+
+  p.vy = Math.min(p.vy + GRAVITY, MAX_FALL);
+
+  const fallSpeed = p.vy;
+  const wasGrounded = p.grounded;
+  if (moveX(p, p.vx)) p.vx = 0;
+  p.ground = null;
+  const hit = moveY(p, p.vy, true);
+  p.grounded = hit === 'floor';
+  if (hit) {
+    if (hit === 'ceil' && p.vy < 0) p.jumpCut = true;
+    p.vy = 0;
+  }
+  if (p.grounded && !wasGrounded) {
+    p.jumpCut = true;
+    if (fallSpeed > 2.5) {
+      p.sx = 1.3; p.sy = 0.75;
+      spawnParticles(p.x + P_W / 2, p.y + P_H, Math.floor(fallSpeed * 1.5), '#c9c9ff', { angle: -Math.PI / 2, spread: 2.6, speed: 1.2, life: 20, grav: 0.06 });
+      sfx('land');
+    }
+  }
+
+  // Пружины подбрасывают на фиксированную высоту
+  for (const sp of game.level.springs) {
+    if (p.vy >= 0 && overlap(p.x, p.y, P_W, P_H + 1, sp.x * TILE + 2, sp.y * TILE + 11, 12, 5)) {
+      p.vy = -SPRING_VELOCITY;
+      p.grounded = false;
+      p.ground = null;
+      p.coyote = 0;
+      p.jumpBuf = 0;
+      p.jumpCut = true;
+      p.sx = 0.6; p.sy = 1.45;
+      sp.squash = 10;
+      spawnParticles(sp.x * TILE + 8, sp.y * TILE + 13, 10, COL.spring, { angle: -Math.PI / 2, spread: 1.8, speed: 1.8, life: 22, grav: 0.05 });
+      sfx('spring');
+    }
+  }
+
+  // Визуальное сжатие/растяжение возвращается к 1
+  p.sx += (1 - p.sx) * 0.2;
+  p.sy += (1 - p.sy) * 0.2;
+
+  p.anim = p.grounded ? (Math.abs(p.vx) > 0.3 ? 'run' : 'idle') : (p.vy < 0 ? 'jump' : 'fall');
+  p.ph++;
+}
+
+function checkHazards() {
+  const p = game.player;
+  if (p.y > WORLD_H + 20) { killPlayer(); return true; }
+  for (const s of game.level.spikes) {
+    if (overlap(p.x + 1, p.y + 1, P_W - 2, P_H - 1, s.x * TILE + 2, s.y * TILE + 9, 12, 7)) {
+      killPlayer();
+      return true;
+    }
+  }
+  for (const b of game.level.beams) {
+    if (overlap(p.x + 1, p.y + 1, P_W - 2, P_H - 2, b.x0, b.y0, b.x1 - b.x0, b.y1 - b.y0)) {
+      sfx('zap');
+      killPlayer();
+      return true;
+    }
+  }
+  return false;
+}
+
+function checkExit() {
+  const p = game.player, ex = game.level.exit;
+  const cx = p.x + P_W / 2, cy = p.y + P_H / 2;
+  if (cx > ex.x * TILE + 1 && cx < ex.x * TILE + 15 && cy > ex.y * TILE - 2 && cy < (ex.y + 1) * TILE) {
+    winLevel();
+    return true;
+  }
+  return false;
+}
+
+function killPlayer() {
+  const p = game.player;
+  game.state = 'dying';
+  game.timer = DEATH_TICKS;
+  game.deaths++;
+  game.fx.shake = 4;
+  game.fx.flash = 10;
+  spawnParticles(p.x + P_W / 2, p.y + P_H / 2, 40, COL.player, { speed: 2.6, life: 40, grav: 0.1, size: 2 });
+  spawnParticles(p.x + P_W / 2, p.y + P_H / 2, 15, '#ffffff', { speed: 1.6, life: 30, grav: 0.05 });
+  spawnRing(p.x + P_W / 2, p.y + P_H / 2, COL.spike, 1.2);
+  sfx('death');
+}
+
+function winLevel() {
+  const ex = game.level.exit;
+  game.state = 'win';
+  game.timer = WIN_TICKS;
+  game.prevBest = Save.best[game.levelIndex] || null;
+  Save.complete(game.levelIndex, game.playTicks, LEVELS[game.levelIndex].echoes - game.echoesLeft);
+  const cx = ex.x * TILE + 8, cy = ex.y * TILE + 8;
+  for (const c of [COL.exit, COL.echo, COL.player, KEY_COLORS.a, KEY_COLORS.b]) {
+    spawnParticles(cx, cy, 14, c, { speed: 2.4, life: 60, grav: 0.03 });
+  }
+  spawnRing(cx, cy, COL.exit, 1.6);
+  sfx('win');
+}
+
+// =====================================================================
+//  7. МИР: КНОПКИ, ДВЕРИ, ПЛАТФОРМЫ
+// =====================================================================
+function entityOnButton(e, b) {
+  return overlap(e.x, e.y, P_W, P_H + 1, b.x * TILE + 2, b.y * TILE + 11, 12, 5);
+}
+
+function keyActive(key) {
+  return game.level.buttons.some(b => b.key === key && b.pressed);
+}
+
+function updateButtons() {
+  const p = game.player;
+  for (const b of game.level.buttons) {
+    const was = b.pressed;
+    b.pressed = entityOnButton(p, b) || game.echoes.some(e => entityOnButton(e, b));
+    if (b.pressed !== was) sfx(b.pressed ? 'buttonOn' : 'buttonOff');
+  }
+}
+
+function playerInDoor(door) {
+  const p = game.player;
+  return door.cells.some(c => overlap(p.x, p.y, P_W, P_H, c.x * TILE, c.y * TILE, TILE, TILE));
+}
+
+function updateDoors() {
+  for (const d of game.level.doors) {
+    const want = d.inv ? !keyActive(d.key) : keyActive(d.key);
+    const before = d.open;
+    if (want) d.open = true;
+    else if (d.open && !playerInDoor(d)) d.open = false;   // дверь не захлопнется на игроке
+    if (d.open !== before) sfx('door');
+    d.amt += ((d.open ? 1 : 0) - d.amt) * DOOR_ANIM_SPEED;
+    if (Math.abs(d.amt - (d.open ? 1 : 0)) < 0.01) d.amt = d.open ? 1 : 0;
+  }
+}
+
+function placePlatform(pl) {
+  const k = pl.p / pl.len;
+  pl.x = pl.ox + pl.ex * k;
+  pl.y = pl.oy + pl.ey * k;
+}
+
+// Платформа едет к конечной точке, пока её кнопка нажата, и возвращается, когда отпущена
+// Маятник: положение — чистая функция времени уровня, поэтому перематывается само
+function loopPosition(pl, t) {
+  const hold = pl.wait * pl.speed;
+  const period = 2 * (pl.len + hold);
+  let ph = (((t + pl.phase) * pl.speed) % period + period) % period;
+  if (ph < hold) return 0;
+  ph -= hold;
+  if (ph < pl.len) return ph;
+  ph -= pl.len;
+  if (ph < hold) return pl.len;
+  return pl.len - (ph - hold);
+}
+
+function updatePlatforms() {
+  for (const pl of game.level.platforms) {
+    pl.prevX = pl.x; pl.prevY = pl.y;
+    if (pl.key) {
+      const dir = keyActive(pl.key) ? 1 : -1;
+      pl.p = Math.max(0, Math.min(pl.len, pl.p + dir * pl.speed));
+    } else {
+      pl.p = loopPosition(pl, game.t);
+    }
+    placePlatform(pl);
+    pl.dx = pl.x - pl.prevX;
+    pl.dy = pl.y - pl.prevY;
+  }
+}
+
+// Лучи лазеров: идут от излучателя до первой стены/закрытой двери,
+// затем обрезаются платформами и эхо (эхо — щит)
+function computeBeams() {
+  const L = game.level;
+  L.beams = [];
+  const blockers = [];
+  for (const e of game.echoes) blockers.push({ x: e.x, y: e.y, w: P_W, h: P_H });
+  for (const pl of L.platforms) blockers.push({ x: pl.x, y: pl.y, w: pl.w, h: pl.h });
+  for (const em of L.lasers) {
+    const [dx, dy] = em.dir;
+    let cx = em.x + dx, cy = em.y + dy;
+    while (!isSolid(cx, cy)) { cx += dx; cy += dy; }
+    let b;
+    if (dy) {
+      const x = em.x * TILE + 8;
+      b = { horiz: false, x0: x - 1, x1: x + 1, y0: (em.y + 1) * TILE, y1: cy * TILE };
+      for (const r of blockers) {
+        if (r.x < x + 1 && r.x + r.w > x - 1 && r.y < b.y1 && r.y + r.h > b.y0) b.y1 = Math.max(b.y0, r.y);
+      }
+    } else {
+      const y = em.y * TILE + 8;
+      b = dx > 0
+        ? { horiz: true, dir: 1, x0: (em.x + 1) * TILE, x1: cx * TILE, y0: y - 1, y1: y + 1 }
+        : { horiz: true, dir: -1, x0: (cx + 1) * TILE, x1: em.x * TILE, y0: y - 1, y1: y + 1 };
+      for (const r of blockers) {
+        if (r.y < y + 1 && r.y + r.h > y - 1 && r.x < b.x1 && r.x + r.w > b.x0) {
+          if (dx > 0) b.x1 = Math.max(b.x0, r.x);
+          else b.x0 = Math.min(b.x1, r.x + r.w);
+        }
+      }
+    }
+    L.beams.push(b);
+  }
+}
+
+// =====================================================================
+//  8. ЗАПИСЬ ВРЕМЕНИ, ПЕРЕМОТКА И ЭХО
+//  Записываем ПОЗИЦИИ игрока (а не нажатия) и снимки мира каждый тик.
+// =====================================================================
+function snapshotWorld() {
+  const L = game.level;
+  return {
+    doors: L.doors.map(d => [d.open, d.amt]),
+    plats: L.platforms.map(pl => pl.p),
+    btns: L.buttons.map(b => b.pressed),
+  };
+}
+
+function restoreWorld(s) {
+  const L = game.level;
+  L.doors.forEach((d, i) => { d.open = s.doors[i][0]; d.amt = s.doors[i][1]; });
+  L.platforms.forEach((pl, i) => {
+    pl.p = s.plats[i];
+    placePlatform(pl);
+    pl.prevX = pl.x; pl.prevY = pl.y; pl.dx = 0; pl.dy = 0;
+  });
+  L.buttons.forEach((b, i) => { b.pressed = s.btns[i]; });
+}
+
+function record() {
+  const p = game.player;
+  game.rec.push({
+    t: game.t, x: p.x, y: p.y, vx: p.vx, vy: p.vy,
+    face: p.face, anim: p.anim, ph: p.ph, grounded: p.grounded,
+  });
+  game.snaps.push(snapshotWorld());
+  if (game.rec.length > REWIND_TICKS + 1) {
+    game.rec.shift();
+    game.snaps.shift();
+  }
+}
+
+// Эхо показывает кадр, соответствующий текущему времени уровня; после конца записи — застывает
+function updateEchoes() {
+  for (const e of game.echoes) {
+    const last = e.frames.length - 1;
+    const i = Math.max(0, Math.min(last, game.t - e.start));
+    const f = e.frames[i];
+    e.prevX = e.x; e.prevY = e.y;
+    e.x = f.x; e.y = f.y;
+    e.dx = e.x - e.prevX; e.dy = e.y - e.prevY;
+    e.face = f.face; e.anim = f.anim; e.ph = f.ph;
+    e.idx = i;
+    e.frozen = i === last;
+  }
+}
+
+function doRewind() {
+  if (game.echoesLeft <= 0 || game.rec.length < MIN_ECHO_TICKS) {
+    sfx('deny');
+    return false;
+  }
+  const p = game.player;
+  const first = game.rec[0];
+  const echo = {
+    frames: game.rec.slice(), start: first.t,
+    x: first.x, y: first.y, prevX: first.x, prevY: first.y, dx: 0, dy: 0,
+    face: first.face, anim: first.anim, ph: first.ph, idx: 0, frozen: false,
+  };
+  spawnParticles(p.x + P_W / 2, p.y + P_H / 2, 16, COL.echo, { speed: 1.8, life: 24, grav: 0 });
+  spawnRing(p.x + P_W / 2, p.y + P_H / 2, COL.echo, 0.7);
+  game.trail = {
+    pts: game.rec.filter((_, i) => i % 2 === 0).map(f => ({ x: f.x + P_W / 2, y: f.y + P_H / 2 })),
+    t: 30, max: 30,
+  };
+
+  // Откат мира и игрока к началу записи
+  restoreWorld(game.snaps[0]);
+  Object.assign(p, {
+    x: first.x, y: first.y, vx: first.vx, vy: first.vy, face: first.face,
+    grounded: first.grounded, ground: first.grounded ? 'tile' : null,
+    coyote: 0, jumpBuf: 0, jumpCut: true, anim: first.anim, ph: first.ph,
+  });
+  game.t = first.t + 1;
+  game.rec = [first];
+  game.snaps = [game.snaps[0]];
+  game.echoes.push(echo);
+  game.echoesLeft--;
+
+  // Все эхо мгновенно переставляем на новый момент времени, без «рывка» скорости
+  updateEchoes();
+  for (const e of game.echoes) { e.prevX = e.x; e.prevY = e.y; e.dx = 0; e.dy = 0; }
+  computeBeams();
+
+  game.fx.rewind = REWIND_FX_TICKS;
+  game.fx.shake = 3;
+  spawnParticles(p.x + P_W / 2, p.y + P_H / 2, 20, COL.echo, { speed: 2.2, life: 26, grav: 0 });
+  spawnRing(p.x + P_W / 2, p.y + P_H / 2, COL.echo, 1.3);
+  savePrev();
+  sfx('rewind');
+  return true;
+}
+
+// =====================================================================
+//  9. ЧАСТИЦЫ
+// =====================================================================
+function spawnParticles(x, y, n, color, o = {}) {
+  for (let i = 0; i < n; i++) {
+    const a = o.angle != null ? o.angle + (Math.random() - 0.5) * (o.spread != null ? o.spread : Math.PI * 2)
+                              : Math.random() * Math.PI * 2;
+    const sp = (o.speed != null ? o.speed : 1.5) * (0.35 + Math.random() * 0.9);
+    const life = Math.floor((o.life || 30) * (0.6 + Math.random() * 0.6));
+    game.particles.push({
+      x, y, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp,
+      life, max: life, color, size: o.size || 2, grav: o.grav != null ? o.grav : 0.08,
+    });
+  }
+}
+
+function updateParticles() {
+  const ps = game.particles;
+  for (let i = ps.length - 1; i >= 0; i--) {
+    const q = ps[i];
+    q.vy += q.grav;
+    q.vx *= 0.97; q.vy *= 0.97;
+    q.x += q.vx; q.y += q.vy;
+    if (--q.life <= 0) ps.splice(i, 1);
+  }
+}
+
+// =====================================================================
+//  10. ОТРИСОВКА
+// =====================================================================
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let SCALE = 1;
+let ALPHA = 1;                 // доля пути между прошлым и текущим тиком — для плавной отрисовки на 120/144 Гц
+let bgCache = null;            // фон уровня: градиент, туманности, звёзды, сетка
+let tileCache = null;          // стены и шипы на прозрачном фоне
+let overlayCache = null;       // виньетка и сканлинии поверх мира
+const lightSprites = {};       // мягкие круги света, по одному на цвет
+
+const lerp = (a, b, k) => a + (b - a) * k;
+// Интерполированная позиция: между состоянием прошлого тика (rx/ry) и текущим
+const ix = (o) => (o.rx == null ? o.x : lerp(o.rx, o.x, ALPHA));
+const iy = (o) => (o.ry == null ? o.y : lerp(o.ry, o.y, ALPHA));
+// Привязка к физическому пикселю экрана: движение плавное, но без размытия
+const snap = (v) => Math.round(v * SCALE) / SCALE;
+// Детерминированный псевдослучай для декора
+const hash = (n) => { const s = Math.sin(n * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); };
+
+function makeCanvas(w, h) {
+  const c = document.createElement('canvas');
+  c.width = Math.max(1, Math.round(w));
+  c.height = Math.max(1, Math.round(h));
+  return c;
+}
+
+// Масштаб: целый (чёткие пиксели), если окно позволяет; внутреннее разрешение = физические пиксели
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  let fit = Math.min(window.innerWidth / VIEW_W, window.innerHeight / VIEW_H) * dpr;
+  if (!(fit > 0.25)) fit = 0.25;        // окно ещё не имеет размера (встраивание, фоновая вкладка)
+  SCALE = fit >= 1 ? Math.floor(fit) : fit;
+  canvas.width = Math.round(VIEW_W * SCALE);
+  canvas.height = Math.round(VIEW_H * SCALE);
+  canvas.style.width = (canvas.width / dpr) + 'px';
+  canvas.style.height = (canvas.height / dpr) + 'px';
+  ctx.imageSmoothingEnabled = false;
+  buildOverlay();
+  if (game.level) buildLevelCache();
+}
+
+// ---------- Кэши: фон, тайлы, виньетка ----------
+function drawBackground(c, seed = 0) {
+  const g = c.createLinearGradient(0, 0, 0, WORLD_H);
+  g.addColorStop(0, COL.bg1);
+  g.addColorStop(1, COL.bg0);
+  c.fillStyle = g;
+  c.fillRect(0, 0, VIEW_W, WORLD_H);
+  // туманности
+  const blobs = [['90,50,200', 0.22], ['30,110,220', 0.18], ['220,60,170', 0.1]];
+  blobs.forEach(([rgb, a], i) => {
+    const x = hash(seed * 3.1 + i) * VIEW_W, y = hash(seed * 7.3 + i + 5) * WORLD_H;
+    const r = 110 + hash(seed + i * 13) * 130;
+    const rg = c.createRadialGradient(x, y, 0, x, y, r);
+    rg.addColorStop(0, `rgba(${rgb},${a})`);
+    rg.addColorStop(1, `rgba(${rgb},0)`);
+    c.fillStyle = rg;
+    c.fillRect(0, 0, VIEW_W, WORLD_H);
+  });
+  // далёкие звёзды
+  for (let i = 0; i < 80; i++) {
+    const x = Math.floor(hash(seed * 11 + i * 1.7) * VIEW_W);
+    const y = Math.floor(hash(seed * 5 + i * 2.3) * WORLD_H);
+    c.fillStyle = `rgba(200,210,255,${0.08 + hash(i * 9.1) * 0.3})`;
+    c.fillRect(x, y, 1, 1);
+  }
+  c.fillStyle = COL.grid;
+  for (let x = 0; x <= VIEW_W; x += TILE) c.fillRect(x, 0, 1, WORLD_H);
+  for (let y = 0; y <= WORLD_H; y += TILE) c.fillRect(0, y, VIEW_W, 1);
+}
+
+// Статика уровня рисуется один раз: фон отдельно, стены и шипы отдельно (между ними — пыль)
+function buildLevelCache() {
+  const L = game.level;
+  if (!L) return;
+  const W = VIEW_W * SCALE, H = WORLD_H * SCALE;
+
+  bgCache = makeCanvas(W, H);
+  let c = bgCache.getContext('2d');
+  c.setTransform(SCALE, 0, 0, SCALE, 0, 0);
+  drawBackground(c, game.levelIndex + 1);
+
+  tileCache = makeCanvas(W, H);
+  c = tileCache.getContext('2d');
+  c.setTransform(SCALE, 0, 0, SCALE, 0, 0);
+  c.imageSmoothingEnabled = false;
+
+  const solidAt = (x, y) => x < 0 || x >= COLS || y < 0 || y >= ROWS || L.solid[y][x];
+  const wallGrad = c.createLinearGradient(0, 0, 0, WORLD_H);
+  wallGrad.addColorStop(0, '#17183d');
+  wallGrad.addColorStop(1, '#0b0b20');
+  for (let y = 0; y < ROWS; y++) {
+    for (let x = 0; x < COLS; x++) {
+      if (!L.solid[y][x]) continue;
+      const px = x * TILE, py = y * TILE;
+      c.fillStyle = wallGrad;
+      c.fillRect(px, py, TILE, TILE);
+      // фаска под открытой верхней гранью
+      if (!solidAt(x, y - 1)) {
+        c.fillStyle = 'rgba(120,135,255,0.16)';
+        c.fillRect(px, py + 1, TILE, 2);
+        c.fillStyle = 'rgba(120,135,255,0.06)';
+        c.fillRect(px, py + 3, TILE, 3);
+      }
+      // «микросхемы» внутри стен
+      const h = hash(x * 31 + y * 17);
+      c.fillStyle = 'rgba(91,108,255,0.13)';
+      if (h > 0.78) {
+        const ly = py + 5 + Math.floor(hash(x + y * 3) * 7);
+        c.fillRect(px + 3, ly, 7, 1);
+        c.fillRect(px + 10, ly - 2, 1, 3);
+      } else if (h < 0.15) {
+        c.fillRect(px + 6, py + 7, 2, 2);
+      }
+    }
+  }
+  // неоновые кромки там, где стена граничит с пустотой
+  c.shadowColor = COL.wallEdge;
+  c.shadowBlur = 8 * SCALE;
+  c.fillStyle = COL.wallEdge;
+  for (let y = 0; y < ROWS; y++) {
+    for (let x = 0; x < COLS; x++) {
+      if (!L.solid[y][x]) continue;
+      const px = x * TILE, py = y * TILE;
+      if (!solidAt(x, y - 1)) c.fillRect(px, py, TILE, 1);
+      if (!solidAt(x, y + 1)) c.fillRect(px, py + TILE - 1, TILE, 1);
+      if (!solidAt(x - 1, y)) c.fillRect(px, py, 1, TILE);
+      if (!solidAt(x + 1, y)) c.fillRect(px + TILE - 1, py, 1, TILE);
+    }
+  }
+  // яркие точки на внешних углах
+  c.shadowBlur = 4 * SCALE;
+  c.fillStyle = '#c9d0ff';
+  for (let y = 0; y < ROWS; y++) {
+    for (let x = 0; x < COLS; x++) {
+      if (!L.solid[y][x]) continue;
+      const px = x * TILE, py = y * TILE;
+      const up = !solidAt(x, y - 1), dn = !solidAt(x, y + 1), lf = !solidAt(x - 1, y), rt = !solidAt(x + 1, y);
+      if (up && lf) c.fillRect(px, py, 1, 1);
+      if (up && rt) c.fillRect(px + TILE - 1, py, 1, 1);
+      if (dn && lf) c.fillRect(px, py + TILE - 1, 1, 1);
+      if (dn && rt) c.fillRect(px + TILE - 1, py + TILE - 1, 1, 1);
+    }
+  }
+  // лазерные излучатели: корпус и линза со стороны выстрела
+  for (const em of L.lasers) {
+    const px = em.x * TILE, py = em.y * TILE;
+    c.shadowBlur = 0;
+    c.fillStyle = '#2a1426';
+    c.fillRect(px + 1, py + 1, TILE - 2, TILE - 2);
+    c.fillStyle = '#5a2140';
+    c.fillRect(px + 3, py + 3, TILE - 6, TILE - 6);
+    c.shadowColor = COL.laser;
+    c.shadowBlur = 8 * SCALE;
+    c.fillStyle = COL.laser;
+    const [dx, dy] = em.dir;
+    if (dx > 0) c.fillRect(px + TILE - 3, py + 5, 3, 6);
+    else if (dx < 0) c.fillRect(px, py + 5, 3, 6);
+    else c.fillRect(px + 5, py + TILE - 3, 6, 3);
+    c.fillStyle = '#ffd0dc';
+    c.fillRect(px + 7, py + 7, 2, 2);
+  }
+  c.shadowBlur = 0;
+  // шипы: градиент от основания к острию + блик
+  for (const s of L.spikes) {
+    const px = s.x * TILE, py = s.y * TILE;
+    const sg = c.createLinearGradient(0, py + 8, 0, py + TILE);
+    sg.addColorStop(0, '#ff6a85');
+    sg.addColorStop(1, '#8a0f2a');
+    c.shadowColor = COL.spike;
+    c.shadowBlur = 6 * SCALE;
+    c.fillStyle = sg;
+    c.beginPath();
+    for (let i = 0; i < 2; i++) {
+      c.moveTo(px + i * 8, py + TILE);
+      c.lineTo(px + i * 8 + 4, py + 8);
+      c.lineTo(px + i * 8 + 8, py + TILE);
+    }
+    c.fill();
+    c.shadowBlur = 0;
+    c.fillStyle = '#ffd0da';
+    c.fillRect(px + 3.5, py + 8.5, 1, 1);
+    c.fillRect(px + 11.5, py + 8.5, 1, 1);
+  }
+  c.shadowBlur = 0;
+}
+
+function buildOverlay() {
+  const W = canvas.width, H = canvas.height;
+  overlayCache = makeCanvas(W, H);
+  const c = overlayCache.getContext('2d');
+  const g = c.createRadialGradient(W / 2, H / 2, Math.min(W, H) * 0.3, W / 2, H / 2, Math.hypot(W, H) * 0.6);
+  g.addColorStop(0, 'rgba(0,0,0,0)');
+  g.addColorStop(1, 'rgba(0,0,0,0.6)');
+  c.fillStyle = g;
+  c.fillRect(0, 0, W, H);
+  // сканлинии — только когда хватает физических пикселей
+  const step = Math.round(SCALE);
+  if (step >= 2) {
+    const h = Math.floor(step / 2);
+    c.fillStyle = 'rgba(0,0,0,0.12)';
+    for (let y = step - h; y < H; y += step) c.fillRect(0, y, W, h);
+  }
+}
+
+function lightSprite(color) {
+  if (lightSprites[color]) return lightSprites[color];
+  const c = makeCanvas(64, 64);
+  const g2 = c.getContext('2d');
+  const g = g2.createRadialGradient(32, 32, 0, 32, 32, 32);
+  g.addColorStop(0, color + 'ff');
+  g.addColorStop(0.25, color + '70');
+  g.addColorStop(1, color + '00');
+  g2.fillStyle = g;
+  g2.fillRect(0, 0, 64, 64);
+  return (lightSprites[color] = c);
+}
+
+function light(x, y, r, color, a) {
+  ctx.globalAlpha = a;
+  ctx.drawImage(lightSprite(color), x - r, y - r, r * 2, r * 2);
+}
+
+// ---------- Атмосферная пыль (не перематывается, чисто декор) ----------
+const motes = [];
+function initMotes() {
+  for (let i = 0; i < 60; i++) {
+    motes.push({
+      x: Math.random() * VIEW_W, y: Math.random() * WORLD_H,
+      z: 0.3 + Math.random() * 0.7,
+      vx: (Math.random() - 0.5) * 0.15, vy: -0.04 - Math.random() * 0.12,
+      ph: Math.random() * Math.PI * 2,
+    });
+  }
+}
+function updateMotes() {
+  for (const m of motes) {
+    m.x += m.vx * m.z;
+    m.y += m.vy * m.z;
+    if (m.y < -4) { m.y = WORLD_H + 4; m.x = Math.random() * VIEW_W; m.rx = m.x; m.ry = m.y; }
+    if (m.x < -4) { m.x = VIEW_W + 4; m.rx = m.x; }
+    if (m.x > VIEW_W + 4) { m.x = -4; m.rx = m.x; }
+  }
+}
+function drawMotes() {
+  const p = game.player;
+  const par = p && game.state !== 'title' ? ix(p) - VIEW_W / 2 : 0;   // лёгкий параллакс за игроком
+  const t = game.clock + ALPHA;
+  for (const m of motes) {
+    let x = ix(m) - par * 0.04 * m.z;
+    x = ((x % VIEW_W) + VIEW_W) % VIEW_W;
+    ctx.globalAlpha = (0.1 + 0.3 * m.z) * (0.6 + 0.4 * Math.sin(t * 0.03 + m.ph));
+    ctx.fillStyle = '#a8b8ff';
+    const s = m.z > 0.8 ? 2 : 1;
+    ctx.fillRect(snap(x), snap(iy(m)), s, s);
+  }
+  ctx.globalAlpha = 1;
+}
+
+// ---------- Ударные волны ----------
+function spawnRing(x, y, color, size = 1) {
+  game.rings.push({ x, y, r: 2, vr: 3.2 * size, life: 24, max: 24, color });
+}
+function updateRings() {
+  for (let i = game.rings.length - 1; i >= 0; i--) {
+    const r = game.rings[i];
+    r.r += r.vr;
+    r.vr *= 0.9;
+    if (--r.life <= 0) game.rings.splice(i, 1);
+  }
+}
+function drawRings() {
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (const r of game.rings) {
+    const k = r.life / r.max;
+    ctx.globalAlpha = k;
+    ctx.strokeStyle = r.color;
+    ctx.lineWidth = 0.5 + 2 * k;
+    ctx.shadowColor = r.color;
+    ctx.shadowBlur = 8 * SCALE;
+    ctx.beginPath();
+    ctx.arc(r.x, r.y, r.r, 0, Math.PI * 2);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+// ---------- Примитивы ----------
+function text(str, x, y, o = {}) {
+  ctx.font = `${o.bold ? 'bold ' : ''}${o.size || 8}px ${FONT}`;
+  ctx.textAlign = o.align || 'left';
+  ctx.textBaseline = 'middle';
+  if (o.maxW) {
+    let size = o.size || 8;
+    while (size > 5 && ctx.measureText(str).width > o.maxW) {
+      size -= 0.5;
+      ctx.font = `${o.bold ? 'bold ' : ''}${size}px ${FONT}`;
+    }
+  }
+  if (o.glow) { ctx.shadowColor = o.glow; ctx.shadowBlur = (o.glowSize || 8) * SCALE; }
+  ctx.fillStyle = o.color || COL.text;
+  ctx.fillText(str, x, y);
+  ctx.shadowBlur = 0;
+}
+
+function drawCharacter(x, y, face, anim, ph, color, alpha, sx = 1, sy = 1, glow = 6, blink = false) {
+  const w = P_W * sx, h = P_H * sy;
+  const left = x + (P_W - w) / 2, top = y + P_H - h;
+  const legH = 3 * sy, bodyH = h - legH;
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = color;
+  // ноги
+  let l1 = 0, l2 = 0;
+  if (anim === 'run') { const s = Math.floor(ph / 5) % 2; l1 = s; l2 = 1 - s; }
+  else if (anim === 'jump' || anim === 'fall') { l1 = l2 = 1; }
+  ctx.fillRect(left + 1, top + bodyH, 3, legH - l1);
+  ctx.fillRect(left + w - 4, top + bodyH, 3, legH - l2);
+  // тело
+  if (glow) { ctx.shadowColor = color; ctx.shadowBlur = glow * SCALE; }
+  ctx.fillRect(left, top, w, bodyH);
+  ctx.shadowBlur = 0;
+  // блик сверху и тень снизу — объём
+  ctx.fillStyle = 'rgba(255,255,255,0.35)';
+  ctx.fillRect(left + 1, top, w - 2, 1);
+  ctx.fillStyle = 'rgba(0,0,0,0.18)';
+  ctx.fillRect(left, top + bodyH - 2, w, 2);
+  // визор смотрит в сторону движения
+  ctx.fillStyle = COL.visor;
+  const vx = face > 0 ? left + w - 6 : left + 1;
+  ctx.fillRect(vx, top + 3 * sy + (blink ? 1 : 0), 5, blink ? 0.6 : 2);
+  if (!blink) {
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    ctx.fillRect(face > 0 ? vx + 3 : vx + 1, top + 3 * sy, 1, 1);
+  }
+  ctx.restore();
+}
+
+// ---------- Объекты мира ----------
+function drawExit() {
+  const ex = game.level.exit;
+  const t = game.clock + ALPHA;
+  const x = ex.x * TILE + 2, y = ex.y * TILE - 4, w = 12, h = 20;
+  const pulse = 0.6 + 0.4 * Math.sin(t * 0.08);
+  ctx.save();
+  const g = ctx.createLinearGradient(0, y, 0, y + h);
+  g.addColorStop(0, `rgba(160,150,255,${0.15 + 0.1 * pulse})`);
+  g.addColorStop(1, `rgba(255,255,255,${0.35 + 0.2 * pulse})`);
+  ctx.fillStyle = g;
+  ctx.fillRect(x, y, w, h);
+  ctx.shadowColor = COL.exit;
+  ctx.shadowBlur = (6 + 8 * pulse) * SCALE;
+  ctx.strokeStyle = COL.exit;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+  ctx.shadowBlur = 0;
+  // искры, поднимающиеся внутри портала
+  ctx.fillStyle = COL.exit;
+  for (let i = 0; i < 6; i++) {
+    const k = ((t * 0.35 + i * 3.7) % h) / h;
+    ctx.globalAlpha = 1 - k;
+    ctx.fillRect(x + 2 + ((i * 5) % (w - 4)), y + h - 2 - k * (h - 3), 1, 1);
+  }
+  // две орбитальные точки
+  for (let i = 0; i < 2; i++) {
+    const a = t * 0.05 + i * Math.PI;
+    ctx.globalAlpha = 0.8;
+    ctx.fillRect(x + w / 2 + Math.cos(a) * 10 - 0.5, y + h / 2 + Math.sin(a) * 13 - 0.5, 1, 1);
+  }
+  ctx.restore();
+}
+
+function drawButtons() {
+  for (const b of game.level.buttons) {
+    const col = KEY_COLORS[b.key];
+    const x = b.x * TILE, y = b.y * TILE;
+    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    ctx.fillRect(x + 2, y + 14, 12, 2);
+    ctx.fillStyle = col;
+    if (b.pressed) { ctx.shadowColor = col; ctx.shadowBlur = 10 * SCALE; }
+    ctx.fillRect(x + 3, y + (b.pressed ? 13 : 11), 10, b.pressed ? 1 : 3);
+    ctx.shadowBlur = 0;
+    if (!b.pressed) {
+      ctx.fillStyle = 'rgba(255,255,255,0.5)';
+      ctx.fillRect(x + 4, y + 11, 8, 1);
+    }
+  }
+}
+
+// Дверь рисуется цельной «шторкой» по каждому столбцу: при открытии уезжает вверх
+function drawDoors() {
+  for (const d of game.level.doors) {
+    const col = KEY_COLORS[d.key];
+    const columns = {};
+    for (const c of d.cells) {
+      const span = columns[c.x] || (columns[c.x] = { top: c.y, bottom: c.y });
+      span.top = Math.min(span.top, c.y);
+      span.bottom = Math.max(span.bottom, c.y);
+    }
+    for (const cx of Object.keys(columns)) {
+      const span = columns[cx];
+      const x = cx * TILE, y = span.top * TILE;
+      const full = (span.bottom - span.top + 1) * TILE;
+      // контур проёма
+      ctx.strokeStyle = col;
+      ctx.globalAlpha = 0.22;
+      ctx.setLineDash([2, 2]);
+      ctx.strokeRect(x + 3.5, y + 0.5, 9, full - 1);
+      ctx.setLineDash([]);
+      ctx.globalAlpha = 1;
+      if (d.amt >= 1) continue;
+      const h = full * (1 - d.amt);
+      ctx.save();
+      ctx.globalAlpha = 0.88;
+      ctx.shadowColor = col;
+      ctx.shadowBlur = 8 * SCALE;
+      ctx.fillStyle = col;
+      ctx.fillRect(x + 3, y, 10, h);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = 'rgba(0,0,0,0.35)';
+      if (d.inv) {
+        // инвертор: тёмная середина и диагональная штриховка
+        ctx.fillStyle = 'rgba(8,6,20,0.7)';
+        ctx.fillRect(x + 5, y + 1, 6, Math.max(0, h - 2));
+        ctx.fillStyle = col;
+        for (let sy = 0; sy < h - 2; sy += 4) ctx.fillRect(x + 5 + (sy / 4 % 3) * 2, y + 1 + sy, 2, 2);
+      } else {
+        for (let sy = h - 3; sy > 0; sy -= 4) ctx.fillRect(x + 4, y + sy, 8, 1);
+      }
+      ctx.fillStyle = 'rgba(255,255,255,0.45)';
+      ctx.fillRect(x + 3, y, 1, h);
+      // энергия, бегущая по закрытой двери
+      const run = ((game.clock + ALPHA) * 0.6) % full;
+      if (run < h) { ctx.fillStyle = 'rgba(255,255,255,0.6)'; ctx.fillRect(x + 4, y + run, 8, 1); }
+      ctx.restore();
+    }
+  }
+}
+
+function drawPlatforms() {
+  for (const pl of game.level.platforms) {
+    const col = platColor(pl);
+    // направляющая
+    ctx.save();
+    ctx.strokeStyle = col;
+    ctx.globalAlpha = 0.2;
+    ctx.setLineDash([2, 3]);
+    ctx.beginPath();
+    ctx.moveTo(pl.ox + pl.w / 2, pl.oy + 2);
+    ctx.lineTo(pl.ox + pl.ex + pl.w / 2, pl.oy + pl.ey + 2);
+    ctx.stroke();
+    ctx.restore();
+    const x = snap(ix(pl)), y = snap(iy(pl));
+    ctx.shadowColor = col;
+    ctx.shadowBlur = 9 * SCALE;
+    ctx.fillStyle = col;
+    ctx.fillRect(x, y, pl.w, pl.h);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.fillRect(x, y, pl.w, 1);
+    ctx.fillStyle = 'rgba(0,0,0,0.35)';
+    ctx.fillRect(x + 1, y + 2, pl.w - 2, 1);
+  }
+}
+
+const platColor = (pl) => (pl.key ? KEY_COLORS[pl.key] : COL.loop);
+
+function drawSprings() {
+  for (const sp of game.level.springs) {
+    const x = sp.x * TILE, y = sp.y * TILE;
+    const k = sp.squash / 10;                       // 1 — только что сработала
+    const top = y + 9 - Math.round(k * 4);
+    ctx.fillStyle = 'rgba(255,255,255,0.25)';
+    ctx.fillRect(x + 2, y + 14, 12, 2);
+    // витки
+    ctx.fillStyle = COL.spring;
+    ctx.globalAlpha = 0.7;
+    for (let yy = top + 3; yy < y + 14; yy += 2) ctx.fillRect(x + 4 + ((yy >> 1) % 2) * 2, yy, 6, 1);
+    ctx.globalAlpha = 1;
+    // площадка
+    ctx.shadowColor = COL.spring;
+    ctx.shadowBlur = 8 * SCALE;
+    ctx.fillRect(x + 2, top, 12, 2);
+    ctx.shadowBlur = 0;
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(x + 3, top, 10, 1);
+  }
+}
+
+function drawBeams() {
+  const t = game.clock + ALPHA;
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (const b of game.level.beams) {
+    const w = b.x1 - b.x0, h = b.y1 - b.y0;
+    if (w <= 0 || h <= 0) continue;
+    const flick = 0.75 + 0.25 * Math.sin(t * 1.3 + b.x0 * 0.1);
+    ctx.shadowColor = COL.laser;
+    ctx.shadowBlur = 10 * SCALE;
+    ctx.globalAlpha = 0.55 * flick;
+    ctx.fillStyle = COL.laser;
+    if (b.horiz) ctx.fillRect(b.x0, b.y0 - 1, w, h + 2);
+    else ctx.fillRect(b.x0 - 1, b.y0, w + 2, h);
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = 0.9;
+    ctx.fillStyle = '#ffe3ea';
+    if (b.horiz) ctx.fillRect(b.x0, b.y0 + 0.5, w, 1);
+    else ctx.fillRect(b.x0 + 0.5, b.y0, 1, h);
+  }
+  ctx.restore();
+}
+
+function drawEchoes() {
+  const t = game.clock + ALPHA;
+  game.echoes.forEach((e, n) => {
+    // шлейф из прошлых кадров
+    if (!e.frozen) {
+      for (let k = 5; k >= 1; k--) {
+        const f = e.frames[e.idx - k * 3];
+        if (!f) continue;
+        drawCharacter(snap(f.x), snap(f.y), f.face, f.anim, f.ph, COL.echo, 0.06 * (6 - k), 1, 1, 0);
+      }
+    }
+    const flick = 0.85 + 0.15 * Math.sin(t * 0.9 + n * 2.1);
+    const glitch = hash(game.clock * 0.37 + n * 13) > 0.97 ? (hash(game.clock + n) > 0.5 ? 1 : -1) : 0;
+    const a = (e.frozen ? 0.5 + 0.08 * Math.sin(t * 0.1) : 0.62) * flick;
+    const x = snap(ix(e)) + glitch, y = snap(iy(e));
+    drawCharacter(x, y, e.face, e.frozen ? 'idle' : e.anim, e.ph, COL.echo, a, 1, 1, 9);
+    // голографические полосы бегут вниз
+    ctx.fillStyle = 'rgba(4,8,30,0.4)';
+    const off = (t * 0.15) % 2;
+    for (let yy = y + off; yy < y + P_H; yy += 2) ctx.fillRect(x, yy, P_W, 0.6);
+  });
+}
+
+// Путь, по которому «сматывается» время при перемотке
+function drawRewindTrail() {
+  const tr = game.trail;
+  if (!tr || tr.t <= 0 || tr.pts.length < 2) return;
+  const k = Math.max(0, (tr.t - ALPHA) / tr.max);
+  const upto = Math.max(1, Math.ceil(tr.pts.length * k));
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.strokeStyle = COL.echo;
+  ctx.lineWidth = 1.5;
+  ctx.lineJoin = 'round';
+  ctx.shadowColor = COL.echo;
+  ctx.shadowBlur = 8 * SCALE;
+  ctx.globalAlpha = Math.min(1, k * 1.6);
+  ctx.beginPath();
+  for (let i = 0; i < upto; i++) {
+    const q = tr.pts[i];
+    if (i) ctx.lineTo(q.x, q.y); else ctx.moveTo(q.x, q.y);
+  }
+  ctx.stroke();
+  const h = tr.pts[upto - 1];
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(h.x - 1.5, h.y - 1.5, 3, 3);
+  ctx.restore();
+}
+
+function drawLights() {
+  const L = game.level, p = game.player, t = game.clock + ALPHA;
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.imageSmoothingEnabled = true;
+  const ex = L.exit;
+  light(ex.x * TILE + 8, ex.y * TILE + 6, 46 + 6 * Math.sin(t * 0.08), '#c8c0ff', 0.32);
+  for (const s of L.spikes) light(s.x * TILE + 8, s.y * TILE + 13, 14, COL.spike, 0.12);
+  for (const b of L.buttons) {
+    light(b.x * TILE + 8, b.y * TILE + 14, b.pressed ? 32 : 14, KEY_COLORS[b.key], b.pressed ? 0.45 : 0.15);
+  }
+  for (const pl of L.platforms) light(ix(pl) + pl.w / 2, iy(pl) + 2, 36, platColor(pl), 0.25);
+  for (const sp of L.springs) light(sp.x * TILE + 8, sp.y * TILE + 12, 18, COL.spring, 0.2);
+  for (const b of L.beams) {
+    const len = b.horiz ? b.x1 - b.x0 : b.y1 - b.y0;
+    for (let d = 8; d < len; d += 24) {
+      light(b.horiz ? b.x0 + d : b.x0 + 1, b.horiz ? b.y0 + 1 : b.y0 + d, 14, COL.laser, 0.12);
+    }
+  }
+  for (const d of L.doors) {
+    if (d.amt >= 1) continue;
+    for (const c of d.cells) light(c.x * TILE + 8, c.y * TILE + 8, 20, KEY_COLORS[d.key], 0.14 * (1 - d.amt));
+  }
+  for (const e of game.echoes) light(ix(e) + P_W / 2, iy(e) + P_H / 2, 34, COL.echo, 0.22);
+  if (p && (game.state === 'play' || game.state === 'win')) {
+    light(ix(p) + P_W / 2, iy(p) + P_H / 2, 58, COL.player, 0.3);
+  }
+  ctx.restore();
+}
+
+function drawParticles() {
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  for (const q of game.particles) {
+    ctx.globalAlpha = Math.max(0, q.life / q.max);
+    ctx.fillStyle = q.color;
+    ctx.fillRect(snap(ix(q)), snap(iy(q)), q.size, q.size);
+  }
+  ctx.restore();
+}
+
+function drawWorld() {
+  if (bgCache) ctx.drawImage(bgCache, 0, 0, VIEW_W, WORLD_H);
+  drawMotes();
+  if (tileCache) ctx.drawImage(tileCache, 0, 0, VIEW_W, WORLD_H);
+  drawLights();
+  drawExit();
+  drawPlatforms();
+  drawButtons();
+  drawSprings();
+  drawDoors();
+  drawBeams();
+  drawRewindTrail();
+  drawEchoes();
+  const p = game.player;
+  const px = snap(ix(p)), py = snap(iy(p));
+  if (game.state === 'play') {
+    const blink = game.clock % 220 < 7 && p.anim !== 'jump' && p.anim !== 'fall';
+    drawCharacter(px, py, p.face, p.anim, p.ph, COL.player, 1, p.sx, p.sy, 9, blink);
+  } else if (game.state === 'win') {
+    const k = game.timer / WIN_TICKS;
+    drawCharacter(px, py, p.face, 'idle', 0, COL.player, k, k, k, 9);
+  }
+  drawParticles();
+  drawRings();
+}
+
+// ---------- HUD и экраны ----------
+function drawHUD() {
+  const def = LEVELS[game.levelIndex];
+  const g = ctx.createLinearGradient(0, 0, 0, HUD_H);
+  g.addColorStop(0, '#0a0a1c');
+  g.addColorStop(1, COL.hud);
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, VIEW_W, HUD_H);
+  ctx.shadowColor = COL.wallEdge;
+  ctx.shadowBlur = 6 * SCALE;
+  ctx.fillStyle = 'rgba(91,108,255,0.6)';
+  ctx.fillRect(0, HUD_H - 1, VIEW_W, 1);
+  ctx.shadowBlur = 0;
+
+  text(`УРОВЕНЬ ${game.levelIndex + 1}/${LEVELS.length}`, 8, 10, { size: 8, bold: true, color: COL.player, glow: COL.player, glowSize: 4 });
+  text(def.name.toUpperCase(), 76, 10, { size: 8, bold: true });
+  text(formatTime(game.playTicks), 360, 10, { size: 7, align: 'right', color: COL.dim });
+  text(def.hint, 8, 22, { size: 7, color: COL.hint, maxW: 352 });
+
+  // счётчик эхо
+  const rx = 372;
+  text('ЭХО', rx, 10, { size: 7, bold: true, color: COL.echo });
+  for (let i = 0; i < def.echoes; i++) {
+    const x = rx + 20 + i * 9;
+    if (i < game.echoesLeft) {
+      ctx.shadowColor = COL.echo; ctx.shadowBlur = 6 * SCALE;
+      ctx.fillStyle = COL.echo;
+      ctx.fillRect(x, 6, 6, 8);
+      ctx.shadowBlur = 0;
+      ctx.fillStyle = COL.visor;
+      ctx.fillRect(x + 2, 8, 3, 1);
+    } else {
+      ctx.strokeStyle = COL.dim;
+      ctx.lineWidth = 1;
+      ctx.strokeRect(x + 0.5, 6.5, 5, 7);
+    }
+  }
+  // заполнение 5-секундного буфера
+  const fill = Math.min(1, (game.rec.length - 1) / REWIND_TICKS);
+  const bx = rx, by = 19, bw = 84, bh = 6;
+  ctx.strokeStyle = COL.dim;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(bx + 0.5, by + 0.5, bw - 1, bh - 1);
+  const ok = game.echoesLeft > 0 && game.rec.length >= MIN_ECHO_TICKS;
+  const fw = (bw - 2) * fill;
+  if (ok) {
+    const bg = ctx.createLinearGradient(bx, 0, bx + bw, 0);
+    bg.addColorStop(0, '#1f7bff');
+    bg.addColorStop(1, COL.echo);
+    ctx.fillStyle = bg;
+    ctx.shadowColor = COL.echo; ctx.shadowBlur = 5 * SCALE;
+  } else {
+    ctx.fillStyle = COL.dim;
+  }
+  ctx.fillRect(bx + 1, by + 1, fw, bh - 2);
+  ctx.shadowBlur = 0;
+  // деления по секундам
+  ctx.fillStyle = 'rgba(0,0,0,0.5)';
+  for (let s = 1; s < 5; s++) ctx.fillRect(bx + 1 + (bw - 2) * s / 5, by + 1, 1, bh - 2);
+  text(`${(fill * 5).toFixed(1)}с`, bx + bw + 4, by + 3, { size: 7, color: ok ? COL.echo : COL.dim });
+}
+
+function formatTime(ticks) {
+  const s = ticks / TPS;
+  const m = Math.floor(s / 60);
+  return `${m}:${(s - m * 60).toFixed(1).padStart(4, '0')}`;
+}
+
+function drawRewindFx() {
+  const k = game.fx.rewind / REWIND_FX_TICKS;
+  const W = canvas.width, H = canvas.height;
+  // хроматический сдвиг: копии кадра со смещением в синем и красном
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.globalAlpha = 0.25 * k;
+  ctx.drawImage(canvas, Math.round(-4 * SCALE * k), 0);
+  ctx.globalAlpha = 0.15 * k;
+  ctx.drawImage(canvas, Math.round(4 * SCALE * k), 0);
+  ctx.restore();
+  // горизонтальные помехи — сдвигаем полосы уже нарисованного кадра
+  for (let i = 0; i < 10; i++) {
+    const y = Math.floor(Math.random() * H);
+    const h = Math.max(1, Math.floor((2 + Math.random() * 10) * SCALE));
+    const dx = Math.round((Math.random() * 2 - 1) * 12 * SCALE * k);
+    ctx.drawImage(canvas, 0, y, W, h, dx, y, W, h);
+  }
+  ctx.fillStyle = `rgba(30,110,255,${0.32 * k})`;
+  ctx.fillRect(0, 0, W, H);
+  ctx.fillStyle = `rgba(0,0,20,${0.25 * k})`;
+  const step = Math.max(2, Math.round(3 * SCALE));
+  for (let y = 0; y < H; y += step) ctx.fillRect(0, y, W, Math.max(1, Math.round(SCALE)));
+}
+
+function drawIntro() {
+  const a = Math.min(1, game.introT / 30, (INTRO_TICKS - game.introT) / 15);
+  if (a <= 0) return;
+  ctx.save();
+  ctx.globalAlpha = a;
+  const g = ctx.createLinearGradient(0, 0, VIEW_W, 0);
+  g.addColorStop(0, 'rgba(4,4,12,0)');
+  g.addColorStop(0.5, 'rgba(4,4,12,0.75)');
+  g.addColorStop(1, 'rgba(4,4,12,0)');
+  ctx.fillStyle = g;
+  ctx.fillRect(0, HUD_H + 56, VIEW_W, 46);
+  const slide = (1 - Math.min(1, (INTRO_TICKS - game.introT) / 20)) * 20;
+  text(`УРОВЕНЬ ${game.levelIndex + 1}`, VIEW_W / 2 - slide, HUD_H + 70, { size: 9, align: 'center', color: COL.echo, bold: true });
+  text(LEVELS[game.levelIndex].name, VIEW_W / 2 + slide, HUD_H + 88, { size: 16, align: 'center', bold: true, glow: COL.player });
+  ctx.restore();
+}
+
+function drawBetween() {
+  const k = Math.min(1, game.timer / 20);
+  ctx.fillStyle = `rgba(4,4,12,${0.8 * k})`;
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  ctx.save();
+  ctx.globalAlpha = k;
+  const def = LEVELS[game.levelIndex];
+  const used = def.echoes - game.echoesLeft;
+  text('УРОВЕНЬ ПРОЙДЕН', VIEW_W / 2, 100 + (1 - k) * 10, { size: 20, bold: true, align: 'center', glow: COL.echo, glowSize: 12 });
+  text(`${game.levelIndex + 1}. ${def.name}`, VIEW_W / 2, 128, { size: 10, align: 'center', color: COL.hint });
+  text(`время: ${formatTime(game.playTicks)}    эхо: ${used}/${def.echoes}    попыток: ${game.deaths + 1}`, VIEW_W / 2, 150, { size: 9, align: 'center', color: COL.text });
+  const pb = game.prevBest;
+  if (pb) {
+    const rec = game.playTicks < pb.ticks ? 'НОВЫЙ РЕКОРД!' : `рекорд: ${formatTime(pb.ticks)}`;
+    text(rec, VIEW_W / 2, 166, { size: 8, align: 'center', color: game.playTicks < pb.ticks ? COL.spring : COL.dim, bold: game.playTicks < pb.ticks });
+  }
+  text(`Дальше: ${game.levelIndex + 2}. ${LEVELS[game.levelIndex + 1].name}`, VIEW_W / 2, 190, { size: 9, align: 'center', color: COL.player });
+  ctx.globalAlpha = k * (0.55 + 0.45 * Math.sin((game.clock + ALPHA) * 0.1));
+  text('Enter — дальше   R — ещё раз   Esc — уровни', VIEW_W / 2, 220, { size: 8, align: 'center', color: COL.hint });
+  ctx.restore();
+}
+
+function drawEnd() {
+  ctx.fillStyle = 'rgba(4,4,12,0.95)';
+  ctx.fillRect(0, 0, VIEW_W, VIEW_H);
+  ctx.save();
+  ctx.translate(0, HUD_H);
+  drawMotes();
+  ctx.restore();
+  for (let i = 3; i >= 1; i--) {
+    text('СПАСИБО ЗА ИГРУ!', VIEW_W / 2, 110 - i * 4, { size: 24, bold: true, align: 'center', color: `rgba(77,232,255,${0.08 * (4 - i)})` });
+  }
+  text('СПАСИБО ЗА ИГРУ!', VIEW_W / 2, 110, { size: 24, bold: true, align: 'center', glow: COL.player, glowSize: 14 });
+  text(`Все ${LEVELS.length} уровней «Эха» пройдены. Прошлое было на твоей стороне.`, VIEW_W / 2, 150, { size: 8, align: 'center', color: COL.hint, maxW: 440 });
+  ctx.save();
+  ctx.globalAlpha = 0.55 + 0.45 * Math.sin((game.clock + ALPHA) * 0.1);
+  text('Enter — в меню', VIEW_W / 2, 200, { size: 8, align: 'center', color: COL.text });
+  ctx.restore();
+  drawRunners(250);
+}
+
+// Бегущий человечек и его эхо (декорация меню)
+function drawRunners(y) {
+  const t = game.clock + ALPHA;
+  const span = VIEW_W + 120;
+  for (let i = 2; i >= 0; i--) {
+    const x = ((t * 1.6 - i * 26) % span + span) % span - 60;
+    const hop = Math.abs(Math.sin((t - i * 16) * 0.06)) * 18;
+    drawCharacter(snap(x), snap(y - P_H - hop), 1, hop > 1 ? 'jump' : 'run', Math.floor(t),
+      i === 0 ? COL.player : COL.echo, i === 0 ? 1 : 0.5 - i * 0.12, 1, 1, 9);
+  }
+  ctx.fillStyle = 'rgba(91,108,255,0.5)';
+  ctx.fillRect(0, y, VIEW_W, 1);
+}
+
+function drawTitle() {
+  ctx.save();
+  ctx.translate(0, HUD_H);
+  drawBackground(ctx, 0);
+  drawMotes();
+  ctx.restore();
+  ctx.fillStyle = COL.bg1;
+  ctx.fillRect(0, 0, VIEW_W, HUD_H);
+
+  const t = game.clock + ALPHA;
+  const cx = VIEW_W / 2;
+  const wob = Math.sin(t * 0.05) * 2;
+  for (let i = 3; i >= 1; i--) {
+    text('ЭХО', cx - i * 12 + wob * i, 66, { size: 48, bold: true, align: 'center', color: `rgba(77,232,255,${0.07 * (4 - i)})` });
+  }
+  text('ЭХО', cx, 66, { size: 48, bold: true, align: 'center', color: '#fff4e6', glow: COL.player, glowSize: 14 });
+  text('головоломка с перемоткой времени', cx, 100, { size: 9, align: 'center', color: COL.hint });
+
+  const lines = [
+    ['← → / A D', 'бег'],
+    ['↑ / W / Пробел', 'прыжок (держи — выше)'],
+    ['Shift', 'перемотка на 5 с — оставляет эхо'],
+    ['R', 'рестарт уровня'],
+    ['Esc / M', 'меню / звук'],
+  ];
+  lines.forEach(([k, v], i) => {
+    text(k, cx - 8, 126 + i * 13, { size: 8, align: 'right', color: COL.echo, bold: true });
+    text(v, cx + 8, 126 + i * 13, { size: 8, color: COL.text });
+  });
+
+  ctx.save();
+  ctx.globalAlpha = 0.55 + 0.45 * Math.sin(t * 0.1);
+  text('Enter / Пробел — выбрать уровень', cx, 212, { size: 9, align: 'center', bold: true, color: COL.player, glow: COL.player, glowSize: 4 });
+  ctx.restore();
+  if (Save.count() > 0) {
+    text(`Пройдено уровней: ${Save.count()}/${LEVELS.length}`, VIEW_W - 8, 14, { size: 7, align: 'right', color: COL.dim });
+  }
+  drawRunners(268);
+}
+
+function drawLock(x, y, col) {
+  ctx.strokeStyle = col;
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  ctx.arc(x, y - 2, 3, Math.PI, 0);
+  ctx.stroke();
+  ctx.fillStyle = col;
+  ctx.fillRect(x - 4.5, y - 2, 9, 7);
+}
+
+function drawSelect() {
+  ctx.save();
+  ctx.translate(0, HUD_H);
+  drawBackground(ctx, 3);
+  drawMotes();
+  ctx.restore();
+  ctx.fillStyle = COL.bg1;
+  ctx.fillRect(0, 0, VIEW_W, HUD_H);
+  const t = game.clock + ALPHA;
+
+  text('ВЫБОР УРОВНЯ', VIEW_W / 2, 20, { size: 13, bold: true, align: 'center', glow: COL.echo, glowSize: 8 });
+  text(`пройдено ${Save.count()}/${LEVELS.length}`, VIEW_W - 12, 20, { size: 7, align: 'right', color: COL.dim });
+
+  const cw = 76, ch = 42, gap = 8;
+  const rows = Math.ceil(LEVELS.length / SELECT_COLS);
+  const gx = (VIEW_W - (SELECT_COLS * cw + (SELECT_COLS - 1) * gap)) / 2;
+  const gy = 40;
+  for (let i = 0; i < LEVELS.length; i++) {
+    const cx = gx + (i % SELECT_COLS) * (cw + gap);
+    const cy = gy + Math.floor(i / SELECT_COLS) * (ch + gap);
+    const open = Save.isUnlocked(i), done = !!Save.cleared[i], sel = i === game.menuSel;
+    const accent = done ? COL.spring : open ? COL.echo : COL.dim;
+    ctx.fillStyle = sel ? 'rgba(255,154,31,0.14)' : 'rgba(12,12,34,0.85)';
+    ctx.fillRect(cx, cy, cw, ch);
+    if (sel) {
+      ctx.shadowColor = COL.player;
+      ctx.shadowBlur = (6 + 3 * Math.sin(t * 0.12)) * SCALE;
+    }
+    ctx.strokeStyle = sel ? COL.player : accent;
+    ctx.globalAlpha = sel ? 1 : open ? 0.6 : 0.35;
+    ctx.lineWidth = 1;
+    ctx.strokeRect(cx + 0.5, cy + 0.5, cw - 1, ch - 1);
+    ctx.shadowBlur = 0;
+    ctx.globalAlpha = 1;
+    if (open) {
+      text(String(i + 1), cx + 8, cy + 14, { size: 14, bold: true, color: sel ? COL.player : COL.text });
+      // сложность — точки
+      const diff = LEVELS[i].diff || 1;
+      for (let d = 0; d < 5; d++) {
+        ctx.fillStyle = d < diff ? (diff >= 5 ? COL.laser : diff >= 4 ? COL.player : COL.echo) : 'rgba(255,255,255,0.12)';
+        ctx.fillRect(cx + 8 + d * 5, cy + 30, 3, 3);
+      }
+      if (done) text('✓', cx + cw - 10, cy + 12, { size: 10, bold: true, align: 'center', color: COL.spring, glow: COL.spring, glowSize: 4 });
+      ctx.save();
+      ctx.globalAlpha = 0.8;
+      text('×' + LEVELS[i].echoes, cx + cw - 8, cy + 31, { size: 7, align: 'right', color: COL.echo });
+      ctx.restore();
+    } else {
+      drawLock(cx + cw / 2, cy + ch / 2, COL.dim);
+    }
+  }
+
+  // информация о выбранном уровне
+  const i = game.menuSel, def = LEVELS[i];
+  const iy0 = gy + rows * (ch + gap) + 4;
+  if (Save.isUnlocked(i)) {
+    text(`${i + 1}. ${def.name}`, VIEW_W / 2, iy0, { size: 10, bold: true, align: 'center', color: COL.player });
+    const b = Save.best[i];
+    const info = b ? `рекорд ${formatTime(b.ticks)} · эхо ${b.echoes}/${def.echoes}` : `эхо на уровень: ${def.echoes}`;
+    text(info, VIEW_W / 2, iy0 + 14, { size: 8, align: 'center', color: COL.hint });
+  } else {
+    text('Закрыт: пройди предыдущие уровни', VIEW_W / 2, iy0 + 6, { size: 8, align: 'center', color: COL.dim });
+  }
+  text('Стрелки — выбор   Enter — играть   Esc — назад', VIEW_W / 2, VIEW_H - 8, { size: 7, align: 'center', color: COL.dim });
+}
+
+function render() {
+  const S = SCALE;
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+  ctx.globalAlpha = 1;
+  ctx.globalCompositeOperation = 'source-over';
+  ctx.fillStyle = '#04040a';
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+  if (game.state === 'title' || game.state === 'select') {
+    ctx.setTransform(S, 0, 0, S, 0, 0);
+    if (game.state === 'title') drawTitle(); else drawSelect();
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
+    if (overlayCache) ctx.drawImage(overlayCache, 0, 0);
+    return;
+  }
+
+  let ox = 0, oy = 0;
+  if (game.fx.shake > 0) {
+    ox = Math.round((Math.random() * 2 - 1) * game.fx.shake * S);
+    oy = Math.round((Math.random() * 2 - 1) * game.fx.shake * S);
+  }
+  ctx.setTransform(S, 0, 0, S, ox, Math.round(HUD_H * S) + oy);
+  drawWorld();
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  if (overlayCache) ctx.drawImage(overlayCache, 0, 0);
+  if (game.fx.rewind > 0) drawRewindFx();
+  if (game.fx.flash > 0) {
+    ctx.fillStyle = `rgba(255,50,80,${game.fx.flash / 40})`;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+  if (game.fade > 0) {
+    ctx.fillStyle = `rgba(4,4,10,${game.fade})`;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+
+  ctx.setTransform(S, 0, 0, S, 0, 0);
+  drawHUD();
+  if (game.state === 'play' && game.introT > 0) drawIntro();
+  if (game.state === 'between') drawBetween();
+  if (game.state === 'end') drawEnd();
+}
+
+// =====================================================================
+//  11. ИГРОВОЙ ЦИКЛ
+// =====================================================================
+function tickTitle() {
+  if (Input.hit('confirm')) {
+    sfx('start');
+    toSelect();
+  }
+}
+
+// Меню уровней: сетка SELECT_COLS × N, стрелки двигают выбор
+const SELECT_COLS = 5;
+function tickSelect() {
+  const n = LEVELS.length;
+  let s = game.menuSel;
+  if (Input.hit('left')) s -= 1;
+  if (Input.hit('right')) s += 1;
+  if (Input.hit('up')) s -= SELECT_COLS;
+  if (Input.hit('down')) s += SELECT_COLS;
+  s = Math.max(0, Math.min(n - 1, s));
+  if (s !== game.menuSel) { game.menuSel = s; sfx('select'); }
+  if (Input.hit('confirm')) {
+    if (Save.isUnlocked(game.menuSel)) { sfx('start'); loadLevel(game.menuSel, true); }
+    else sfx('deny');
+  }
+  if (Input.hit('back')) toTitle();
+}
+
+// Один тик геймплея — порядок важен для синхронности эхо и мира
+function tickPlay() {
+  if (Input.hit('back')) { toSelect(game.levelIndex); return; }
+  if (Input.hit('restart')) { loadLevel(game.levelIndex, false); return; }
+  if (Input.hit('rewind') && doRewind()) return;
+
+  updateEchoes();       // 1. эхо встают в позиции текущего момента
+  updateButtons();      // 2. кнопки: игрок + эхо
+  updateDoors();        // 3. двери
+  updatePlatforms();    // 4. платформы
+  carryPlayer();        // 5. игрок едет вместе с опорой (платформа/эхо)
+  updatePlayer();       // 6. управление и физика игрока
+  computeBeams();       // 7. лучи с учётом новых позиций эхо, платформ и дверей
+  game.playTicks++;
+  if (checkHazards()) return;
+  if (checkExit()) return;
+  record();             // 8. запись кадра и снимка мира
+  game.t++;
+}
+
+function tickDying() {
+  if (--game.timer <= 0) loadLevel(game.levelIndex, false);
+}
+
+function tickWin() {
+  if (game.timer % 6 === 0) {
+    const ex = game.level.exit;
+    spawnParticles(ex.x * TILE + 8, ex.y * TILE + 6, 3, COL.exit, { angle: -Math.PI / 2, spread: 1.5, speed: 1.4, life: 40, grav: -0.01 });
+  }
+  if (--game.timer <= 0) {
+    if (game.levelIndex >= LEVELS.length - 1) game.state = 'end';
+    else { game.state = 'between'; game.timer = 0; }
+  }
+}
+
+function tickBetween() {
+  game.timer++;
+  if (game.timer > 15 && Input.hit('confirm')) {
+    sfx('start');
+    loadLevel(game.levelIndex + 1, true);
+  }
+  if (Input.hit('restart')) loadLevel(game.levelIndex, true);
+  if (Input.hit('back')) toSelect(game.levelIndex + 1);
+}
+
+function tickEnd() {
+  if (Input.hit('confirm') || Input.hit('back')) toSelect(LEVELS.length - 1);
+}
+
+// Декоративные частицы: выхлоп едущих платформ и пыль из-под ног при беге
+function spawnAmbientParticles() {
+  for (const sp of game.level.springs) if (sp.squash > 0) sp.squash--;
+  // искры в точке, где луч упирается в препятствие
+  if (game.clock % 4 === 0) {
+    game.level.beams.forEach((b, i) => {
+      const em = game.level.lasers[i];
+      const ex = b.horiz ? (b.dir > 0 ? b.x1 : b.x0) : em.x * TILE + 8;
+      const ey = b.horiz ? em.y * TILE + 8 : b.y1;
+      spawnParticles(ex, ey, 1, '#ff9ab5', { speed: 1.2, life: 12, grav: 0.05, size: 1 });
+    });
+  }
+  for (const pl of game.level.platforms) {
+    if (Math.abs(pl.dx) + Math.abs(pl.dy) > 0.01 && game.clock % 3 === 0) {
+      spawnParticles(pl.x + 2 + Math.random() * (pl.w - 4), pl.y + pl.h, 1, platColor(pl), { angle: Math.PI / 2, spread: 0.6, speed: 0.6, life: 14, grav: 0.02, size: 1 });
+    }
+  }
+  const p = game.player;
+  if (p.grounded && Math.abs(p.vx) > 1.2 && p.ph % 8 === 0) {
+    spawnParticles(p.x + P_W / 2 - p.face * 3, p.y + P_H, 2, '#8f96c8', { angle: -Math.PI / 2 - p.face * 0.8, spread: 0.8, speed: 0.7, life: 16, grav: 0.03, size: 1 });
+  }
+}
+
+// Запоминаем позиции до тика — отрисовка интерполирует между ними и новыми
+function savePrev() {
+  const p = game.player;
+  if (p) { p.rx = p.x; p.ry = p.y; }
+  for (const e of game.echoes) { e.rx = e.x; e.ry = e.y; }
+  if (game.level) for (const pl of game.level.platforms) { pl.rx = pl.x; pl.ry = pl.y; }
+  for (const q of game.particles) { q.rx = q.x; q.ry = q.y; }
+  for (const m of motes) { m.rx = m.x; m.ry = m.y; }
+}
+
+function tick() {
+  savePrev();
+  game.clock++;
+  if (Input.hit('mute')) Sound.toggleMute();
+  switch (game.state) {
+    case 'title': tickTitle(); break;
+    case 'select': tickSelect(); break;
+    case 'play': tickPlay(); break;
+    case 'dying': tickDying(); break;
+    case 'win': tickWin(); break;
+    case 'between': tickBetween(); break;
+    case 'end': tickEnd(); break;
+  }
+  if (game.state === 'play') spawnAmbientParticles();
+  updateParticles();
+  updateMotes();
+  updateRings();
+  if (game.trail && game.trail.t > 0) game.trail.t--;
+  if (game.fx.rewind > 0) game.fx.rewind--;
+  if (game.fx.flash > 0) game.fx.flash--;
+  if (game.fx.shake > 0) game.fx.shake = Math.max(0, game.fx.shake - 0.25);
+  if (game.fade > 0) game.fade = Math.max(0, game.fade - 0.07);
+  if (game.introT > 0) game.introT--;
+  Input.endTick();
+}
+
+// Фиксированный шаг: симуляция 60 тиков/с независимо от частоты монитора,
+// а отрисовка — каждый кадр монитора с интерполяцией (плавно на 120/144 Гц)
+let lastTime = 0;
+let accumulator = 0;
+function frame(now) {
+  if (!lastTime) lastTime = now;
+  let dt = (now - lastTime) / 1000;
+  lastTime = now;
+  if (dt > 0.25) dt = 0.25;           // после сворачивания вкладки не «догоняем» секунды
+  accumulator += dt;
+  while (accumulator >= STEP) {
+    tick();
+    accumulator -= STEP;
+  }
+  ALPHA = accumulator / STEP;
+  render();
+  requestAnimationFrame(frame);
+}
+
+function boot() {
+  Save.load();
+  initMotes();
+  toTitle();
+  resize();
+  window.addEventListener('resize', resize);
+  requestAnimationFrame(frame);
+}
+
+boot();
+</script>
+</body>
+</html>
