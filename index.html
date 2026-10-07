@@ -554,6 +554,151 @@ const LEVELS = [
       '##############################',
     ],
   },
+  {
+    name: 'Шлюз',
+    diff: 4,
+    hint: 'Пока эхо держит кнопку — луч спит. Успей проскочить и спрятаться.',
+    echoes: 1,
+    map: [
+      '##############################',
+      '#.........#....v.....#.......#',
+      '#.........#....W.....#.......#',
+      '#.........#..........#.......#',
+      '#.........#..........#.......#',
+      '#.........#..........#.......#',
+      '#.........#..........#.......#',
+      '#.........#..........#.......#',
+      '#.........#..........#.......#',
+      '#.........#..........#.......#',
+      '#.........#..........#.......#',
+      '#.........#..........#.......#',
+      '#.........A..........W.......#',
+      '#.........A..........W.......#',
+      '#.P..a....A..........W.....E.#',
+      '##############################',
+    ],
+  },
+  {
+    name: 'Двойная пропасть',
+    diff: 5,
+    hint: 'Одной опоры в воздухе мало.',
+    echoes: 2,
+    map: [
+      '##############################',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#..P......................E..#',
+      '#########...........##########',
+      '#########...........##########',
+      '#########^^^^^^^^^^^##########',
+      '##############################',
+    ],
+  },
+  {
+    name: 'Лестница в небо',
+    diff: 5,
+    hint: 'Каждое эхо — ступенька выше предыдущей. Лови момент после вершины прыжка.',
+    echoes: 3,
+    map: [
+      '##############################',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#.........................E..#',
+      '#...............##############',
+      '#...............##############',
+      '#...............##############',
+      '#...............##############',
+      '#...............##############',
+      '#...............##############',
+      '#..P............##############',
+      '##############################',
+    ],
+  },
+  {
+    name: 'Часовой механизм',
+    diff: 5,
+    hint: 'Лучи гаснут, когда их перекрывает маятник. А уступ высоковат…',
+    echoes: 1,
+    platforms: { 1: { dx: 4, dy: 0, speed: 1, wait: 20 }, 2: { dx: 4, dy: 0, speed: 1.3, wait: 10, phase: 50 }, 3: { dx: 4, dy: 0, speed: 0.8, wait: 30, phase: 100 } },
+    map: [
+      '##############################',
+      '#.......v....v....v..........#',
+      '#............................#',
+      '#....11........33............#',
+      '#.........22.................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#............................#',
+      '#.........................E..#',
+      '#.....................########',
+      '#.....................########',
+      '#.....................########',
+      '#.....................########',
+      '#.P...................########',
+      '##############################',
+    ],
+  },
+  {
+    name: 'Тройная роль',
+    diff: 5,
+    hint: 'Ступенька. Ключ. Отмычка. И всё это — одно эхо за пять секунд.',
+    echoes: 1,
+    map: [
+      '##############################',
+      '#..#...#.....................#',
+      '#..#...#.....................#',
+      '#..#...#.....................#',
+      '#..#...#.....................#',
+      '#..#...#.....................#',
+      '#..#...#.....................#',
+      '#..#...#.....................#',
+      '#..#...#.....................#',
+      '#..W...A.....................#',
+      '#..W...A.....................#',
+      '#E.W...A.....................#',
+      '###########..................#',
+      '###########..................#',
+      '###########.......P.......a..#',
+      '##############################',
+    ],
+  },
+  {
+    name: 'Финал',
+    diff: 5,
+    hint: 'Всё, чему ты научился. Четыре эха — и ни одного лишнего.',
+    echoes: 4,
+    map: [
+      '##############################',
+      '#......v#....................#',
+      '#......A#....................#',
+      '#.......#....................#',
+      '#.......#....................#',
+      '#.......#....................#',
+      '#.......#.................E..#',
+      '#.......#..............#######',
+      '#.......#..............#######',
+      '#.......A..............#######',
+      '#.......A..............#######',
+      '#.P..a..A..............#######',
+      '#############.......##########',
+      '#############.......##########',
+      '#############^^^^^^^##########',
+      '##############################',
+    ],
+  },
   // --- NEW LEVELS END
 ];
 
@@ -640,8 +785,7 @@ const game = {
   fx: { rewind: 0, shake: 0, flash: 0 },
 };
 
-// Прогресс: какие уровни пройдены и лучшие результаты. Открыт уровень, если пройдено
-// не меньше (номер − 1) уровней — то есть один трудный уровень можно пропустить.
+// Прогресс: какие уровни пройдены и лучшие результаты. Все уровни открыты сразу.
 const Save = {
   cleared: [],
   best: {},                // { [index]: { ticks, echoes } }
@@ -665,9 +809,8 @@ const Save = {
     this.write();
   },
   count() { return LEVELS.reduce((n, _, i) => n + (this.cleared[i] ? 1 : 0), 0); },
-  isUnlocked(i) { return i <= this.count() + 1; },
-  firstOpen() {
-    for (let i = 0; i < LEVELS.length; i++) if (!this.cleared[i] && this.isUnlocked(i)) return i;
+  firstUncleared() {
+    for (let i = 0; i < LEVELS.length; i++) if (!this.cleared[i]) return i;
     return 0;
   },
 };
@@ -715,7 +858,7 @@ function toTitle() {
 
 function toSelect(index) {
   game.state = 'select';
-  game.menuSel = index != null ? index : Save.firstOpen();
+  game.menuSel = index != null ? index : Save.firstUncleared();
   game.particles = [];
 }
 
@@ -2009,16 +2152,6 @@ function drawTitle() {
   drawRunners(268);
 }
 
-function drawLock(x, y, col) {
-  ctx.strokeStyle = col;
-  ctx.lineWidth = 1.5;
-  ctx.beginPath();
-  ctx.arc(x, y - 2, 3, Math.PI, 0);
-  ctx.stroke();
-  ctx.fillStyle = col;
-  ctx.fillRect(x - 4.5, y - 2, 9, 7);
-}
-
 function drawSelect() {
   ctx.save();
   ctx.translate(0, HUD_H);
@@ -2039,8 +2172,8 @@ function drawSelect() {
   for (let i = 0; i < LEVELS.length; i++) {
     const cx = gx + (i % SELECT_COLS) * (cw + gap);
     const cy = gy + Math.floor(i / SELECT_COLS) * (ch + gap);
-    const open = Save.isUnlocked(i), done = !!Save.cleared[i], sel = i === game.menuSel;
-    const accent = done ? COL.spring : open ? COL.echo : COL.dim;
+    const done = !!Save.cleared[i], sel = i === game.menuSel;
+    const accent = done ? COL.spring : COL.echo;
     ctx.fillStyle = sel ? 'rgba(255,154,31,0.14)' : 'rgba(12,12,34,0.85)';
     ctx.fillRect(cx, cy, cw, ch);
     if (sel) {
@@ -2048,40 +2181,32 @@ function drawSelect() {
       ctx.shadowBlur = (6 + 3 * Math.sin(t * 0.12)) * SCALE;
     }
     ctx.strokeStyle = sel ? COL.player : accent;
-    ctx.globalAlpha = sel ? 1 : open ? 0.6 : 0.35;
+    ctx.globalAlpha = sel ? 1 : done ? 0.75 : 0.45;
     ctx.lineWidth = 1;
     ctx.strokeRect(cx + 0.5, cy + 0.5, cw - 1, ch - 1);
     ctx.shadowBlur = 0;
     ctx.globalAlpha = 1;
-    if (open) {
-      text(String(i + 1), cx + 8, cy + 14, { size: 14, bold: true, color: sel ? COL.player : COL.text });
-      // сложность — точки
-      const diff = LEVELS[i].diff || 1;
-      for (let d = 0; d < 5; d++) {
-        ctx.fillStyle = d < diff ? (diff >= 5 ? COL.laser : diff >= 4 ? COL.player : COL.echo) : 'rgba(255,255,255,0.12)';
-        ctx.fillRect(cx + 8 + d * 5, cy + 30, 3, 3);
-      }
-      if (done) text('✓', cx + cw - 10, cy + 12, { size: 10, bold: true, align: 'center', color: COL.spring, glow: COL.spring, glowSize: 4 });
-      ctx.save();
-      ctx.globalAlpha = 0.8;
-      text('×' + LEVELS[i].echoes, cx + cw - 8, cy + 31, { size: 7, align: 'right', color: COL.echo });
-      ctx.restore();
-    } else {
-      drawLock(cx + cw / 2, cy + ch / 2, COL.dim);
+    text(String(i + 1), cx + 8, cy + 14, { size: 14, bold: true, color: sel ? COL.player : COL.text });
+    // сложность — точки
+    const diff = LEVELS[i].diff || 1;
+    for (let d = 0; d < 5; d++) {
+      ctx.fillStyle = d < diff ? (diff >= 5 ? COL.laser : diff >= 4 ? COL.player : COL.echo) : 'rgba(255,255,255,0.12)';
+      ctx.fillRect(cx + 8 + d * 5, cy + 30, 3, 3);
     }
+    if (done) text('✓', cx + cw - 10, cy + 12, { size: 10, bold: true, align: 'center', color: COL.spring, glow: COL.spring, glowSize: 4 });
+    ctx.save();
+    ctx.globalAlpha = 0.8;
+    text('×' + LEVELS[i].echoes, cx + cw - 8, cy + 31, { size: 7, align: 'right', color: COL.echo });
+    ctx.restore();
   }
 
   // информация о выбранном уровне
   const i = game.menuSel, def = LEVELS[i];
   const iy0 = gy + rows * (ch + gap) + 4;
-  if (Save.isUnlocked(i)) {
-    text(`${i + 1}. ${def.name}`, VIEW_W / 2, iy0, { size: 10, bold: true, align: 'center', color: COL.player });
-    const b = Save.best[i];
-    const info = b ? `рекорд ${formatTime(b.ticks)} · эхо ${b.echoes}/${def.echoes}` : `эхо на уровень: ${def.echoes}`;
-    text(info, VIEW_W / 2, iy0 + 14, { size: 8, align: 'center', color: COL.hint });
-  } else {
-    text('Закрыт: пройди предыдущие уровни', VIEW_W / 2, iy0 + 6, { size: 8, align: 'center', color: COL.dim });
-  }
+  text(`${i + 1}. ${def.name}${Save.cleared[i] ? '  ✓' : ''}`, VIEW_W / 2, iy0, { size: 10, bold: true, align: 'center', color: COL.player });
+  const b = Save.best[i];
+  const info = b ? `рекорд ${formatTime(b.ticks)} · эхо ${b.echoes}/${def.echoes}` : `ещё не пройден · эхо на уровень: ${def.echoes}`;
+  text(info, VIEW_W / 2, iy0 + 14, { size: 8, align: 'center', color: COL.hint });
   text('Стрелки — выбор   Enter — играть   Esc — назад', VIEW_W / 2, VIEW_H - 8, { size: 7, align: 'center', color: COL.dim });
 }
 
@@ -2151,8 +2276,8 @@ function tickSelect() {
   s = Math.max(0, Math.min(n - 1, s));
   if (s !== game.menuSel) { game.menuSel = s; sfx('select'); }
   if (Input.hit('confirm')) {
-    if (Save.isUnlocked(game.menuSel)) { sfx('start'); loadLevel(game.menuSel, true); }
-    else sfx('deny');
+    sfx('start');
+    loadLevel(game.menuSel, true);
   }
   if (Input.hit('back')) toTitle();
 }
